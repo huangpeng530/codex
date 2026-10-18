@@ -537,6 +537,24 @@ pub(crate) fn finalize_tool_router(
         &code_mode_tool_names,
         hosted_specs,
     );
+    // Safety net: strip any remaining ToolSpec::Namespace that the gateway
+    // (Agnes and similar) doesn't accept. Flatten to individual functions.
+    let model_visible_specs: Vec<ToolSpec> = model_visible_specs
+        .into_iter()
+        .flat_map(|spec| match spec {
+            ToolSpec::Namespace(ns) => {
+                // Convert namespace to individual function specs as a final fallback.
+                ns.tools
+                    .into_iter()
+                    .filter_map(|inner| match inner {
+                        ResponsesApiNamespaceTool::Function(f) => Some(ToolSpec::Function(f)),
+                        ResponsesApiNamespaceTool::Custom(c) => Some(ToolSpec::Freeform(c)),
+                    })
+                    .collect()
+            }
+            other => vec![other],
+        })
+        .collect();
     let tool_namespaces_info = include_tool_namespaces_info
         .then(|| {
             collect_tool_namespaces_info(&registry, &code_mode_tool_names, &model_visible_specs)
