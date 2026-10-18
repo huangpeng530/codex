@@ -96,7 +96,33 @@ fn is_h1_heading(line: &str) -> bool {
 
 /// Build a minimal fallback model descriptor for missing/unknown slugs.
 pub fn model_info_from_slug(slug: &str) -> ModelInfo {
-    warn!("Unknown model {slug} is used. This will use fallback model metadata.");
+    // Third-party gateway models are registered below; only warn for slugs we
+    // genuinely know nothing about.
+    builtin_gateway_model_info(slug).unwrap_or_else(|| {
+        warn!("Unknown model {slug} is used. This will use fallback model metadata.");
+        fallback_model_info(slug)
+    })
+}
+
+/// Metadata for third-party gateway models whose providers do not serve a
+/// Codex-compatible `/models` catalog (e.g. Agnes AI Hub, whose catalog
+/// response lacks the required `ModelInfo` fields).
+///
+/// Registering them here keeps every turn from logging an "unknown model"
+/// warning and silently falling back to generic metadata.
+fn builtin_gateway_model_info(slug: &str) -> Option<ModelInfo> {
+    if !slug.starts_with("agnes-") {
+        return None;
+    }
+    let mut info = fallback_model_info(slug);
+    info.used_fallback_model_metadata = false;
+    // These gateways reject the Responses API `namespace` tool type, so keep
+    // Responses Lite off: tools are then serialized individually as `function`.
+    info.use_responses_lite = false;
+    Some(info)
+}
+
+fn fallback_model_info(slug: &str) -> ModelInfo {
     ModelInfo {
         slug: slug.to_string(),
         display_name: slug.to_string(),

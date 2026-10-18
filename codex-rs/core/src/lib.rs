@@ -1,3 +1,4 @@
+#![recursion_limit = "512"]
 //! Root of the `codex-core` library.
 
 // Prevent accidental direct writes to stdout/stderr in library code. All

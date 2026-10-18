@@ -65,6 +65,7 @@ use codex_features::Feature;
 use codex_features::SleepToolMode;
 use codex_login::AuthManager;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
+
 use codex_prompts::ResolvedModelMessages;
 use codex_protocol::DEFAULT_FUNCTION_NAMESPACE;
 use codex_protocol::account::PlanType;
@@ -81,6 +82,7 @@ use codex_protocol::openai_models::ToolMode;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_tools::IndirectNamespacePrefixes;
 use codex_tools::ResponsesApiNamespaceTool;
+use codex_tools::ResponsesApiTool;
 use codex_tools::TOOL_SEARCH_TOOL_NAME;
 use codex_tools::ToolCall as ExtensionToolCall;
 use codex_tools::ToolEnvironmentMode;
@@ -631,6 +633,11 @@ fn build_model_visible_specs(
     code_mode_tool_names: &BTreeMap<String, ToolName>,
     hosted_specs: Vec<ToolSpec>,
 ) -> Vec<ToolSpec> {
+    // Third-party gateways (non-OpenAI providers, e.g. Agnes AI Hub) usually
+    // reject the Responses API `namespace` tool type with a 400
+    // ("unknown variant `namespace`"). Flatten namespace specs into plain
+    // function specs for them; OpenAI keeps the native namespace encoding.
+    let flatten_namespaces = !turn_context.provider.info().is_openai();
     let mut specs = Vec::new();
     for tool in registry.entries() {
         let exposure = tool.exposure;
@@ -640,18 +647,71 @@ fn build_model_visible_specs(
 
         let tool_name = tool.runtime.tool_name();
         let spec = Arc::unwrap_or_clone(tool.spec());
-        specs.push(spec_for_model_request(
+        let spec = spec_for_model_request(
             turn_context,
             model_info,
             exposure,
             &tool_name,
             code_mode_tool_names,
             spec,
-        ));
+        );
+        if flatten_namespaces {
+            expand_namespace_spec_for_gateway(tool_name.clone(), spec, &mut specs);
+        } else {
+            specs.push(spec);
+        }
     }
     specs.extend(hosted_specs);
 
     merge_into_namespaces(specs)
+}
+
+/// Turn a `ToolSpec::Namespace` into one `ToolSpec::Function` per nested tool,
+/// so the wire type is always `function` (not `namespace`).
+///
+/// Only used for non-OpenAI providers: their gateways typically accept just
+/// `function` / `web_search_preview` / `code_interpreter` / `mcp` tool types.
+fn expand_namespace_spec_for_gateway(
+    tool_name: ToolName,
+    spec: ToolSpec,
+    out: &mut Vec<ToolSpec>,
+) {
+    let ToolSpec::Namespace(namespace) = spec else {
+        out.push(spec);
+        return;
+    };
+    // Tools in the default namespace keep their bare name; everything else gets
+    // a fully-qualified `namespace.tool` name so the model still calls
+    // `clock.curr_time` instead of just `curr_time`.
+    let namespace_prefix = if tool_name.is_default_namespace() {
+        None
+    } else {
+        tool_name.namespace.clone()
+    };
+    for nested in namespace.tools {
+        let ResponsesApiNamespaceTool::Function(inner) = nested else {
+            // Custom/freeform nested tools — keep as-is (they become function or freeform).
+            out.push(ToolSpec::Freeform(
+                match nested {
+                    ResponsesApiNamespaceTool::Custom(c) => c,
+                    _ => unreachable!(),
+                },
+            ));
+            continue;
+        };
+        let full_name = match &namespace_prefix {
+            Some(ns) => format!("{ns}.{}", inner.name),
+            None => inner.name.clone(),
+        };
+        out.push(ToolSpec::Function(ResponsesApiTool {
+            name: full_name,
+            description: inner.description,
+            strict: inner.strict,
+            defer_loading: inner.defer_loading,
+            parameters: inner.parameters,
+            output_schema: inner.output_schema,
+        }));
+    }
 }
 
 fn spec_for_model_request(

@@ -20,6 +20,7 @@ use crate::tools::spec_plan::finalize_tool_router;
 use codex_otel::SessionTelemetry;
 use codex_otel::TOOL_REGISTRATIONS_METRIC;
 use codex_otel::TOOL_REGISTRATIONS_METRIC_BUCKETS;
+use codex_protocol::DEFAULT_FUNCTION_NAMESPACE;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::SearchToolCallParams;
 #[cfg(test)]
@@ -79,6 +80,28 @@ pub(crate) fn tool_log_payload<'a>(
         return Cow::Borrowed("[plaintext arguments]");
     }
     payload.log_payload()
+}
+
+/// Reinterpret a dotted call name (`namespace.tool`) as a namespaced tool name.
+///
+/// When namespace specs are flattened into plain function specs for
+/// third-party gateways (see `expand_namespace_spec_for_gateway`), the model
+/// calls `clock.curr_time` instead of receiving a separate namespace. Split
+/// the name back so the registry lookup finds the namespaced tool. Names
+/// without a dot (ordinary tools) pass through unchanged.
+fn resolve_dotted_tool_name(tool_name: ToolName) -> ToolName {
+    let has_explicit_namespace = tool_name
+        .namespace
+        .as_deref()
+        .is_some_and(|namespace| !namespace.is_empty() && namespace != DEFAULT_FUNCTION_NAMESPACE);
+    if !has_explicit_namespace
+        && let Some((namespace, name)) = tool_name.name.split_once('.')
+        && !namespace.is_empty()
+        && !name.is_empty()
+    {
+        return ToolName::namespaced(namespace, name);
+    }
+    tool_name.with_default_namespace()
 }
 
 /// One finalized tool plan: its advertised surfaces and matching executable runtimes.
@@ -264,7 +287,7 @@ impl ToolRouter {
                 call_id,
                 ..
             } => {
-                let tool_name = ToolName::new(namespace, name).with_default_namespace();
+                let tool_name = resolve_dotted_tool_name(ToolName::new(namespace, name));
                 Ok(Some(ToolCall {
                     tool_name,
                     call_id,
