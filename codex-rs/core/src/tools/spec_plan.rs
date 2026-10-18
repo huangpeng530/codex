@@ -633,11 +633,6 @@ fn build_model_visible_specs(
     code_mode_tool_names: &BTreeMap<String, ToolName>,
     hosted_specs: Vec<ToolSpec>,
 ) -> Vec<ToolSpec> {
-    // Third-party gateways (non-OpenAI providers, e.g. Agnes AI Hub) usually
-    // reject the Responses API `namespace` tool type with a 400
-    // ("unknown variant `namespace`"). Flatten namespace specs into plain
-    // function specs for them; OpenAI keeps the native namespace encoding.
-    let flatten_namespaces = !turn_context.provider.info().is_openai();
     let mut specs = Vec::new();
     for tool in registry.entries() {
         let exposure = tool.exposure;
@@ -655,11 +650,10 @@ fn build_model_visible_specs(
             code_mode_tool_names,
             spec,
         );
-        if flatten_namespaces {
-            expand_namespace_spec_for_gateway(tool_name.clone(), spec, &mut specs);
-        } else {
-            specs.push(spec);
-        }
+        // Flatten namespace-type specs into individual function specs so the
+        // gateway (which only recognises function/mcp/code_interpreter/web_search_preview)
+        // doesn't reject them as an unknown variant.
+        expand_namespace_spec_for_gateway(tool_name.clone(), spec, &mut specs);
     }
     specs.extend(hosted_specs);
 
