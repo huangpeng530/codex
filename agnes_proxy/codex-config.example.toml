@@ -1,0 +1,50 @@
+model = "agnes-3.0-flash"
+model_provider = "agnes"
+web_search = "disabled"
+model_reasoning_effort = "high"
+sandbox_mode = "danger-full-access"
+# Context management: 70% of the 524288-token window -> auto-compact
+model_context_window = 524288
+model_auto_compact_token_limit = 367000
+
+[model_providers.agnes]
+name = "Agnes AI Hub"
+base_url = "http://127.0.0.1:8787/v1"
+env_key = "AGNES_API_KEY"
+wire_api = "responses"
+
+[desktop]
+followUpQueueMode = "steer"
+conversationDetailMode = "STEPS_COMMANDS"
+sansFontSize = 14
+codeFontSize = 13
+ambient-suggestions-enabled = true
+localeOverride = "zh-CN"
+projectlessWorkspaceRoot = 'E:\BACK-AI\Codex'
+open-local-url-in-target-preference = "external-browser"
+show-context-window-usage = true
+autoArchiveAfterDays = 7
+appearanceTheme = "dark"
+
+[windows]
+sandbox = "elevated"
+
+[tui]
+screen_reader_detection_done = true
+
+[tui.model_availability_nux]
+"gpt-6.1-sol" = 1
+
+[features]
+memories = true
+
+[memories]
+generate_memories = true
+use_memories = true
+
+[projects.'e:\back-ai\codex\memories']
+trust_level = "trusted"
+
+[projects.'e:\back-ai\codex']
+trust_level = "trusted"
+

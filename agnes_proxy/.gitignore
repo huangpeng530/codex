@@ -1,0 +1,4 @@
+﻿requests/
+*.bak*
+*.log
+__pycache__/
