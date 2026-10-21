@@ -261,6 +261,7 @@ mod update_versions;
 mod updates;
 #[cfg(any(not(debug_assertions), test))]
 mod updates_cache;
+mod user_prompt;
 mod version;
 mod vim_search;
 mod width;
@@ -683,7 +684,8 @@ pub(crate) async fn start_embedded_app_server_for_picker(
 ) -> color_eyre::Result<AppServerSession> {
     let mut target = AppServerTarget::Embedded;
     let mut state_db = init_state_db_for_app_server_target(config, &target).await?;
-    let app_server = start_app_server(
+    // Keep the shared test fixture's frame independent of embedded startup size.
+    let app_server = Box::pin(start_app_server(
         &mut target,
         Arg0DispatchPaths::default(),
         config.clone(),
@@ -696,7 +698,7 @@ pub(crate) async fn start_embedded_app_server_for_picker(
         &mut state_db,
         Arc::new(EnvironmentManager::default_for_tests()),
         Default::default(),
-    )
+    ))
     .await?;
     Ok(AppServerSession::new(
         crate::backend_id::BackendId::new(),

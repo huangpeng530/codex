@@ -99,6 +99,13 @@ impl<H: ReviewHost> SynchronousApprovalReviewer for ReviewRequest<'_, H> {
         async_approval: Option<ExtensionFuture<'a, ()>>,
     ) -> ExtensionFuture<'a, Option<ReviewDecision>> {
         Box::pin(async move {
+            if async_approval.is_none() {
+                self.telemetry.counter(
+                    "codex.guardian.review.route",
+                    /*inc*/ 1,
+                    &[("route", "required_sync"), ("reason", reason.into())],
+                );
+            }
             let deadline = Instant::now() + crate::REVIEW_TIMEOUT;
             let (prepared, report) = match self
                 .host
@@ -119,6 +126,7 @@ impl<H: ReviewHost> SynchronousApprovalReviewer for ReviewRequest<'_, H> {
                 let prepared = Arc::clone(&prepared);
                 let cancellation = cancellation.clone();
                 let attempts = Arc::clone(&attempts);
+                let telemetry = self.telemetry.clone();
                 async move {
                     crate::run_with_retry(
                         GuardianReviewSessionLimits {
@@ -126,6 +134,7 @@ impl<H: ReviewHost> SynchronousApprovalReviewer for ReviewRequest<'_, H> {
                             deadline,
                         },
                         Some(&cancellation),
+                        Some(&telemetry),
                         |deadline| {
                             attempts.fetch_add(/*val*/ 1, Ordering::Relaxed);
                             host.attempt(&prepared, deadline, &cancellation)
@@ -170,7 +179,7 @@ impl<H: ReviewHost> SynchronousApprovalReviewer for ReviewRequest<'_, H> {
             };
             let completed_at_ms = codex_analytics::now_unix_millis();
             let cached_approval = matches!(outcome, GuardianReviewOutcome::CachedApproval);
-            let completed = report.complete(
+            let (completed, elapsed) = report.complete(
                 outcome,
                 self.model,
                 self.require_guardian,
@@ -186,6 +195,7 @@ impl<H: ReviewHost> SynchronousApprovalReviewer for ReviewRequest<'_, H> {
                 self.analytics,
                 completed.analytics,
                 completed_at_ms,
+                elapsed,
             );
             if let Some(message) = completed.warning {
                 self.host

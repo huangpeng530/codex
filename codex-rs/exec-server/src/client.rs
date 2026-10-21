@@ -327,9 +327,10 @@ impl ConnectionState {
             ConnectionStatus::Connected(rpc_client) if !rpc_client.is_disconnected() => {
                 EnvironmentConnectionState::Connected
             }
-            ConnectionStatus::Connected(_)
-            | ConnectionStatus::Recovering
-            | ConnectionStatus::Failed(_) => EnvironmentConnectionState::Disconnected,
+            ConnectionStatus::Connected(_) | ConnectionStatus::Recovering => {
+                EnvironmentConnectionState::Recovering
+            }
+            ConnectionStatus::Failed(_) => EnvironmentConnectionState::Disconnected,
         };
         let _ = self
             .environment_connection_state_tx
@@ -700,6 +701,8 @@ pub enum ExecServerError {
     Json(#[from] serde_json::Error),
     #[error("HTTP request failed: {0}")]
     HttpRequest(String),
+    #[error("request not sent: {0}")]
+    RequestNotSent(String),
     #[error("authentication required: {0}")]
     AuthenticationRequired(String),
     #[error("exec-server protocol error: {0}")]

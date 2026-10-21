@@ -4,6 +4,7 @@
 //! request/response plumbing out of `App` and `ChatWidget`.
 
 mod daybreak_api_key_compat;
+mod events;
 mod external_agent_config;
 pub(crate) mod fs;
 mod history;
@@ -22,6 +23,7 @@ mod web_search;
 #[path = "app_server_session/collaboration_catalog_tests.rs"]
 mod collaboration_catalog_tests;
 
+pub(crate) use events::AppServerSessionEvent;
 pub(crate) use history::HISTORY_ITEM_PAGE_LIMIT;
 pub(crate) use history::HISTORY_ITEM_SCAN_LIMIT;
 pub(crate) use history::HistoryHydrationScope;
@@ -43,7 +45,6 @@ use crate::status::StatusAccountDisplay;
 use crate::status::plan_type_display_name;
 use crate::terminal_visualization_instructions::with_terminal_visualization_instructions;
 use codex_app_server_client::AppServerClient;
-use codex_app_server_client::AppServerEvent;
 use codex_app_server_client::AppServerPath;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
@@ -384,6 +385,17 @@ pub(crate) struct AppServerStartedThread {
 pub(crate) fn is_active_writer_error(err: &color_eyre::eyre::Report) -> bool {
     err.chain()
         .any(|cause| cause.to_string().contains("already has an active writer"))
+}
+
+/// Recognizes a draining server's refusal, using the legacy message only when data is absent.
+pub(crate) fn is_server_shutting_down_error(error: &JSONRPCErrorError) -> bool {
+    error.code == JSONRPC_INVALID_REQUEST
+        && match &error.data {
+            Some(data) => {
+                data.get("reason").and_then(serde_json::Value::as_str) == Some("serverShuttingDown")
+            }
+            None => error.message == "Server is draining; retry after reconnecting",
+        }
 }
 
 pub(crate) fn source_agent_path(source: &SessionSource) -> Option<String> {
@@ -854,8 +866,14 @@ impl AppServerSession {
             .map_err(|err| bootstrap_request_error("account/read failed during TUI bootstrap", err))
     }
 
-    pub(crate) async fn next_event(&mut self) -> Option<AppServerEvent> {
-        self.client.next_event().await
+    pub(crate) async fn next_event(&mut self) -> Option<AppServerSessionEvent> {
+        self.client
+            .next_event()
+            .await
+            .map(|event| AppServerSessionEvent {
+                backend_id: self.backend_id,
+                event,
+            })
     }
 
     #[cfg(test)]

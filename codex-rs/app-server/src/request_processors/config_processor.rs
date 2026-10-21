@@ -374,6 +374,7 @@ pub(super) async fn reload_user_config(
 }
 
 async fn reload_user_config_inner(config_manager: &ConfigManager, thread_manager: &ThreadManager) {
+    config_manager.revoke_mcp_ema_startups();
     if let Err(err) = config_manager.load_config_layers(/*cwd*/ None).await {
         tracing::warn!("failed to rebuild user config for runtime refresh: {err}");
         for thread_id in thread_manager.list_thread_ids().await {
@@ -438,7 +439,7 @@ async fn reload_user_config_inner(config_manager: &ConfigManager, thread_manager
     }
 }
 
-fn map_requirements_to_api(
+pub(crate) fn map_requirements_to_api(
     requirements: Option<ConfigRequirementsToml>,
     allowed_login_methods: Vec<ForcedLoginMethod>,
 ) -> Option<ConfigRequirements> {
@@ -559,7 +560,10 @@ fn map_requirements_to_api(
         feature_requirements: requirements
             .feature_requirements
             .map(|requirements| requirements.entries),
-        hooks: requirements.hooks.map(map_hooks_requirements_to_api),
+        hooks: requirements
+            .hooks
+            .map(map_hooks_requirements_to_api)
+            .map(Box::new),
         enforce_residency: requirements
             .enforce_residency
             .map(map_residency_requirement_to_api),
@@ -714,6 +718,8 @@ fn map_hooks_requirements_to_api(hooks: ManagedHooksRequirementsToml) -> Managed
         hooks,
     } = hooks;
     let HookEventsToml {
+        pre_model_request,
+        post_model_request,
         pre_tool_use,
         permission_request,
         post_tool_use,
@@ -726,11 +732,13 @@ fn map_hooks_requirements_to_api(hooks: ManagedHooksRequirementsToml) -> Managed
         subagent_stop,
         stop,
         interrupt,
-    } = hooks;
+    } = *hooks;
 
     ManagedHooksRequirements {
         managed_dir,
         windows_managed_dir,
+        pre_model_request: map_hook_matcher_groups_to_api(pre_model_request),
+        post_model_request: map_hook_matcher_groups_to_api(post_model_request),
         pre_tool_use: map_hook_matcher_groups_to_api(pre_tool_use),
         permission_request: map_hook_matcher_groups_to_api(permission_request),
         post_tool_use: map_hook_matcher_groups_to_api(post_tool_use),

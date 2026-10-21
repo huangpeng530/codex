@@ -343,6 +343,19 @@ pub enum CloudConfigBundleBindingStatus {
 }
 
 impl CloudConfigBundleBinding {
+    /// Wait until this delivered policy no longer authorizes its EMA owner.
+    pub async fn invalidated(&self) {
+        let mut changes = self.policy.0.subscribe();
+        loop {
+            if self.read().status != CloudConfigBundleBindingStatus::Current {
+                return;
+            }
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     /// Keeps the policy observation stable until this guard is dropped.
     pub fn read(&self) -> CloudConfigBundleBindingGuard<'_> {
         let state = self.policy.0.borrow();

@@ -408,6 +408,7 @@ impl HarnessKeyValidator for RegistryHarnessKeyValidator {
         &self,
         harness_public_key: &NoiseChannelPublicKey,
         authorization: &str,
+        stream_id: Option<uuid::Uuid>,
     ) -> Result<(), ExecServerError> {
         let environment_id = &self.environment_id;
         let url = endpoint_url(
@@ -420,15 +421,17 @@ impl HarnessKeyValidator for RegistryHarnessKeyValidator {
             harness_key_authorization: authorization.to_string(),
         };
         let (auth_headers, executor_credential) = self.client.resolve_auth().await?;
-        let response = self
+        let mut request = self
             .client
             .http_for_auth()
             .post(url)
             .headers(auth_headers)
             .headers(current_trace_context_headers())
-            .json(&body)
-            .send()
-            .await?;
+            .json(&body);
+        if let Some(stream_id) = stream_id {
+            request = request.header("x-codex-noise-stream-id", stream_id.to_string());
+        }
+        let response = request.send().await?;
         let status = response.status();
         if !status.is_success() {
             // The request contains the short-lived authorization. Do not include
@@ -560,7 +563,7 @@ impl std::fmt::Debug for StaticBearerAuthProvider {
 }
 
 impl AuthProvider for StaticBearerAuthProvider {
-    fn add_auth_headers(&self, headers: &mut HeaderMap) {
+    fn add_auth_headers(&self, headers: &mut HeaderMap) -> Result<(), codex_api::AuthError> {
         headers.insert(http::header::AUTHORIZATION, self.authorization.clone());
         if let Some(chatgpt_account_id) = &self.chatgpt_account_id {
             headers.insert(
@@ -568,6 +571,7 @@ impl AuthProvider for StaticBearerAuthProvider {
                 chatgpt_account_id.clone(),
             );
         }
+        Ok(())
     }
 }
 
@@ -1130,7 +1134,9 @@ mod tests {
     struct StaticRegistryAuthProvider;
 
     impl AuthProvider for StaticRegistryAuthProvider {
-        fn add_auth_headers(&self, _headers: &mut HeaderMap) {}
+        fn add_auth_headers(&self, _headers: &mut HeaderMap) -> Result<(), codex_api::AuthError> {
+            Ok(())
+        }
 
         fn resolve_auth_headers(&self) -> codex_api::AuthHeadersFuture<'_> {
             Box::pin(async {
@@ -1155,11 +1161,12 @@ mod tests {
     struct ScopedExecutorAuth;
 
     impl AuthProvider for ScopedExecutorAuth {
-        fn add_auth_headers(&self, headers: &mut HeaderMap) {
+        fn add_auth_headers(&self, headers: &mut HeaderMap) -> Result<(), codex_api::AuthError> {
             headers.insert(
                 AUTHORIZATION,
                 HeaderValue::from_static("Bearer synthetic-scoped-token"),
             );
+            Ok(())
         }
     }
 
@@ -1168,8 +1175,12 @@ mod tests {
         struct InvalidExecutorAuth(HeaderMap);
 
         impl AuthProvider for InvalidExecutorAuth {
-            fn add_auth_headers(&self, headers: &mut HeaderMap) {
+            fn add_auth_headers(
+                &self,
+                headers: &mut HeaderMap,
+            ) -> Result<(), codex_api::AuthError> {
                 headers.extend(self.0.clone());
+                Ok(())
             }
         }
 
@@ -1235,7 +1246,11 @@ mod tests {
                 executor_registration_id: "registration".to_string(),
             };
             let validation = validator
-                .validate_harness_key(&public_key, "harness-authorization")
+                .validate_harness_key(
+                    &public_key,
+                    "harness-authorization",
+                    /*stream_id*/ None,
+                )
                 .await
                 .expect_err("invalid credentials must be rejected");
             assert!(matches!(
@@ -1317,7 +1332,11 @@ mod tests {
             executor_registration_id: "registration".to_string(),
         };
         let error = validator
-            .validate_harness_key(&public_key, "harness-authorization")
+            .validate_harness_key(
+                &public_key,
+                "harness-authorization",
+                /*stream_id*/ None,
+            )
             .await
             .expect_err("validation must reject a non-loopback HTTP registry");
         assert!(matches!(
@@ -1400,7 +1419,11 @@ mod tests {
             environment_id: "environment-requested".to_string(),
             executor_registration_id: "registration".to_string(),
         }
-        .validate_harness_key(&public_key, "harness-authorization")
+        .validate_harness_key(
+            &public_key,
+            "harness-authorization",
+            /*stream_id*/ None,
+        )
         .await
         .expect("validate directly");
         registry.verify().await;
@@ -1418,11 +1441,15 @@ mod tests {
         const TOKEN: &str = "synthetic-scoped-registry-secret";
         struct ExecutorAuth;
         impl AuthProvider for ExecutorAuth {
-            fn add_auth_headers(&self, headers: &mut HeaderMap) {
+            fn add_auth_headers(
+                &self,
+                headers: &mut HeaderMap,
+            ) -> Result<(), codex_api::AuthError> {
                 let mut credential =
                     HeaderValue::from_str(&format!("Bearer {TOKEN}")).expect("bearer");
                 credential.set_sensitive(true);
                 headers.insert(AUTHORIZATION, credential);
+                Ok(())
             }
         }
         let encoded_echo = serde_json::json!({
@@ -1488,7 +1515,11 @@ mod tests {
                 executor_registration_id: "registration".to_string(),
             };
             let validation = validator
-                .validate_harness_key(&public_key, "harness-authorization")
+                .validate_harness_key(
+                    &public_key,
+                    "harness-authorization",
+                    /*stream_id*/ None,
+                )
                 .await
                 .expect_err("invalid validation response");
             assert!(!format!("{validation:?} {validation}").contains(TOKEN));

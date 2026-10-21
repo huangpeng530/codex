@@ -163,7 +163,8 @@ pub(crate) struct SessionConfiguration {
     pub(super) thread_source: Option<ThreadSource>,
     /// Effective originator used for this thread's Responses requests and analytics events.
     pub(super) originator: String,
-    pub(super) dynamic_tools: Vec<DynamicToolSpec>,
+    /// Fixed at thread startup and shared with turn snapshots.
+    pub(super) dynamic_tools: Arc<[DynamicToolSpec]>,
     pub(super) user_shell_override: Option<shell::Shell>,
 }
 
@@ -662,6 +663,25 @@ async fn warm_plugins_and_skills_for_session_init(
 }
 
 impl Session {
+    pub(super) async fn effective_thread_config_snapshot(
+        &self,
+        configuration: &SessionConfiguration,
+        environments: Vec<TurnEnvironmentSelection>,
+    ) -> ThreadConfigSnapshot {
+        let mut snapshot = configuration.thread_config_snapshot(environments);
+        let model_info = Box::pin(configuration.step_settings.resolve_model_info(
+            self.services.models_manager.as_ref(),
+            &configuration.model_info_overrides,
+        ))
+        .await;
+        snapshot.service_tier = get_service_tier(
+            snapshot.service_tier.take(),
+            &configuration.original_config_do_not_use.features,
+            &model_info,
+        );
+        snapshot
+    }
+
     /// Returns the concrete identity for this thread.
     pub(crate) fn thread_id(&self) -> ThreadId {
         self.thread_id
@@ -678,8 +698,11 @@ impl Session {
     }
 
     pub(crate) async fn dynamic_tools(&self) -> Vec<DynamicToolSpec> {
-        let state = self.state.lock().await;
-        state.session_configuration.dynamic_tools.clone()
+        let dynamic_tools = {
+            let state = self.state.lock().await;
+            Arc::clone(&state.session_configuration.dynamic_tools)
+        };
+        dynamic_tools.to_vec()
     }
 
     pub(crate) async fn responses_metadata(
@@ -778,6 +801,7 @@ impl Session {
     pub(crate) async fn new(
         startup: Option<Arc<super::startup::SessionStartup>>,
         mut session_configuration: SessionConfiguration,
+        prompt_cache_key: PromptCacheKey,
         environment_selections: &[TurnEnvironmentSelection],
         config: Arc<Config>,
         mut instructions: SessionInstructions,
@@ -1066,7 +1090,7 @@ impl Session {
                                 text: session_configuration.base_instructions.clone(),
                                 provenance: base_instructions_provenance.clone(),
                             },
-                            dynamic_tools: session_configuration.dynamic_tools.clone(),
+                            dynamic_tools: session_configuration.dynamic_tools.to_vec(),
                             selected_capability_roots: selected_capability_roots.clone(),
                             multi_agent_version: initial_multi_agent_version,
                             history_mode: session_configuration.history_mode,
@@ -1479,6 +1503,7 @@ impl Session {
                 inherited_environments.clone(),
                 config.features.enabled(Feature::DeferredExecutor),
             ));
+            turn_environments.update_configured_selections(environment_selections);
             turn_environments.update_selections(environment_selections);
             session_configuration.environments = turn_environments.selections();
             let resolved_environments = turn_environments.snapshot().await;
@@ -1805,6 +1830,7 @@ impl Session {
                     InitialHistory::Resumed(_) | InitialHistory::Forked(_)
                 ))
                 .with_session_context(
+                    prompt_cache_key,
                     crate::guardian::prompt_cache_key_override_for_review_session(
                         &session_configuration.session_source,
                         session_configuration.parent_thread_id,
@@ -1872,8 +1898,12 @@ impl Session {
                 *guard = Arc::downgrade(&sess);
             }
             // Dispatch the SessionConfiguredEvent first and then report any errors.
-            let thread_config =
-                session_configuration.thread_config_snapshot(turn_environments.selections());
+            let thread_config = sess
+                .effective_thread_config_snapshot(
+                    &session_configuration,
+                    turn_environments.selections(),
+                )
+                .await;
             let events = std::iter::once(Event {
                 id: INITIAL_SUBMIT_ID.to_owned(),
                 msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
@@ -1942,12 +1972,13 @@ impl Session {
             } else {
                 mcp_projection
             };
-            sess.install_initial_mcp_runtime(
+            // Keep MCP startup's large future out of the surrounding session initialization frame.
+            Box::pin(sess.install_initial_mcp_runtime(
                 &session_configuration,
                 latest_auth,
                 mcp_projection,
                 &resolved_environments,
-            )
+            ))
             .await?;
             sess.start_mcp_prewarm_worker(mcp_prewarm_rx, mcp_auth_changes);
             sess.follow_inherited_environment_configurations(

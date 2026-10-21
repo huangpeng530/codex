@@ -1984,6 +1984,8 @@ class HookErrorInfo(BaseModel):
 
 
 class HookEventName(Enum):
+    pre_model_request = "preModelRequest"
+    post_model_request = "postModelRequest"
     pre_tool_use = "preToolUse"
     permission_request = "permissionRequest"
     post_tool_use = "postToolUse"
@@ -2422,8 +2424,14 @@ class ManagedHooksRequirements(BaseModel):
         list[ConfiguredHookMatcherGroup], Field(alias="PermissionRequest")
     ]
     post_compact: Annotated[list[ConfiguredHookMatcherGroup], Field(alias="PostCompact")]
+    post_model_request: Annotated[
+        list[ConfiguredHookMatcherGroup] | None, Field(alias="PostModelRequest")
+    ] = []
     post_tool_use: Annotated[list[ConfiguredHookMatcherGroup], Field(alias="PostToolUse")]
     pre_compact: Annotated[list[ConfiguredHookMatcherGroup], Field(alias="PreCompact")]
+    pre_model_request: Annotated[
+        list[ConfiguredHookMatcherGroup] | None, Field(alias="PreModelRequest")
+    ] = []
     pre_tool_use: Annotated[list[ConfiguredHookMatcherGroup], Field(alias="PreToolUse")]
     session_end: Annotated[list[ConfiguredHookMatcherGroup] | None, Field(alias="SessionEnd")] = []
     session_start: Annotated[list[ConfiguredHookMatcherGroup], Field(alias="SessionStart")]
@@ -3139,6 +3147,8 @@ class PlanType(str, Enum):
     edu = "edu"
     edu_plus = "edu_plus"
     edu_pro = "edu_pro"
+    sci = "sci"
+    sci_plus = "sci_plus"
     unknown = "unknown"
 
     @classmethod
@@ -8326,6 +8336,40 @@ class ExternalAgentImportedConnectorCandidate(BaseModel):
     source: ExternalAgentImportedConnectorSource
 
 
+class FeedbackSaveParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    classification: str
+    extra_log_files: Annotated[list[str] | None, Field(alias="extraLogFiles")] = None
+    include_logs: Annotated[bool | None, Field(alias="includeLogs")] = None
+    reason: str | None = None
+    save_path: Annotated[
+        LegacyAppPathString,
+        Field(
+            alias="savePath",
+            description="Absolute, previously unused ZIP path on the app-server host. The caller owns this file, including after a disconnected RPC.",
+        ),
+    ]
+    tags: dict[str, Any] | None = None
+    thread_id: Annotated[str | None, Field(alias="threadId")] = None
+
+
+class FeedbackSaveResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    prompt_hash: Annotated[
+        str | None,
+        Field(
+            alias="promptHash",
+            description="Same prompt hash as feedback/upload; null when prompt metadata is absent.",
+        ),
+    ] = None
+    saved_path: Annotated[LegacyAppPathString, Field(alias="savedPath")]
+    thread_id: Annotated[str, Field(alias="threadId")]
+
+
 class PathFileSystemPath(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -10879,6 +10923,15 @@ class AccountLoginStartRequest(BaseModel):
     params: LoginAccountParams
 
 
+class FeedbackSaveRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[Literal["feedback/save"], Field(title="Feedback/saveRequestMethod")]
+    params: FeedbackSaveParams
+
+
 class CommandExecRequest(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -12926,6 +12979,7 @@ class ClientRequest(
         | AccountWorkspaceMessagesReadRequest
         | AccountSendAddCreditsNudgeEmailRequest
         | FeedbackUploadRequest
+        | FeedbackSaveRequest
         | CommandExecRequest
         | CommandExecWriteRequest
         | CommandExecTerminateRequest
@@ -13037,6 +13091,7 @@ class ClientRequest(
         | AccountWorkspaceMessagesReadRequest
         | AccountSendAddCreditsNudgeEmailRequest
         | FeedbackUploadRequest
+        | FeedbackSaveRequest
         | CommandExecRequest
         | CommandExecWriteRequest
         | CommandExecTerminateRequest

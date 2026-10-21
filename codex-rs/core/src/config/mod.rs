@@ -1127,7 +1127,7 @@ pub struct Config {
     /// Default: `300000` (5 minutes).
     pub background_terminal_max_timeout: u64,
 
-    /// Idle timeout for unsubscribed app-server threads, resolved at server startup.
+    /// Idle timeout for unsubscribed app-server threads.
     pub thread_unload_delay: Duration,
 
     /// Compatibility-only settings retained for legacy `ghost_snapshot`
@@ -1182,7 +1182,7 @@ pub struct Config {
     /// Voluntarily left as Optional because the default value might depend on the client.
     pub analytics_enabled: Option<bool>,
 
-    /// When `false`, disables feedback collection across Codex product surfaces.
+    /// When `false`, disables feedback uploads and background Guardian review retention. Explicit local exports remain available.
     /// Defaults to `true`.
     pub feedback_enabled: bool,
 
@@ -1403,7 +1403,7 @@ impl MultiAgentV2Config {
             root_agent_usage_hint_text: None,
             subagent_usage_hint_text: None,
             subagent_developer_instructions: None,
-            preserve_fork_prefix: false,
+            preserve_fork_prefix: true,
             multi_agent_mode_hint_text: None,
             tool_namespace: Some(DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE.to_string()),
             hide_spawn_agent_metadata: true,
@@ -1878,6 +1878,8 @@ impl Config {
             requires_read_only_mcp_tools: false,
             codex_home: self.codex_home.to_path_buf(),
             mcp_enterprise_managed_auth: self.mcp_enterprise_managed_auth.clone(),
+            ema_state: Default::default(),
+            mcp_ema_cancellation: self.config_layer_stack.mcp_ema_cancellation().clone(),
             xaa_enabled: self.features.enabled(Feature::UseXaa)
                 && self.mcp_enterprise_managed_auth.is_some(),
             mcp_oauth_credentials_store_mode: self.mcp_oauth_credentials_store_mode,
