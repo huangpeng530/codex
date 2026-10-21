@@ -23,6 +23,8 @@ codex_app.* 等）序列化成 Responses 请求里的 `type:"namespace"` 工具�
 | `install.ps1` | 幂等注册/注销两个计划任务（路径无关，可重跑） |
 | `codex-config.example.toml` | `~/.codex/config.toml` 示例（base_url 指向代理） |
 | `sync_doc.py` | 把机制文档同步到 Obsidian / ima（工具脚本） |
+| `run_hidden.vbs` | 无窗口启动器（wscript GUI 宿主，避免直接启动 powershell 时的黑屏闪烁） |
+
 
 ## 安装 / 重装恢复（三步）
 
@@ -30,7 +32,7 @@ codex_app.* 等）序列化成 Responses 请求里的 `type:"namespace"` 工具�
    `git clone git@github.com:huangpeng530/codex.git`
 2. 注册计划任务（需管理员；脚本会自动 UAC 提权重跑）：
    `powershell -NoProfile -ExecutionPolicy Bypass -File <仓库>\agnes_proxy\install.ps1`
-   生成 `AgnesCodexProxy`（登录自启）与 `AgnesCodexProxyWatchdog`（每 5 分钟检查）；
+   生成 `AgnesCodexProxy`（登录自启）与 `AgnesCodexProxyWatchdog`（每 5 分钟检查），均以 wscript 无窗口方式启动；
    任务参数指向克隆目录本身，换路径无需改任何脚本。
 3. 恢复 Codex 配置与密钥：
    - 复制 `codex-config.example.toml` → `%USERPROFILE%\.codex\config.toml`
