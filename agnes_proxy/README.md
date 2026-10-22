@@ -24,7 +24,7 @@ codex_app.* 等）序列化成 Responses 请求里的 `type:"namespace"` 工具�
 | `codex-config.example.toml` | `~/.codex/config.toml` 示例（base_url 指向代理） |
 | `sync_doc.py` | 把机制文档同步到 Obsidian / ima（工具脚本） |
 | `run_hidden.vbs` | 无窗口启动器（wscript GUI 宿主，避免直接启动 powershell 时的黑屏闪烁） |
-
+| `probe_direct.py` | 直连能力探测：判断代理是否可撤（每次升级后跑一次） |
 
 ## 安装 / 重装恢复（三步）
 
@@ -48,6 +48,17 @@ codex_app.* 等）序列化成 Responses 请求里的 `type:"namespace"` 工具�
 2. PATH 里的 `python`
 3. `C:\Python3*\python.exe`（取版本号最高的）
 4. `%LOCALAPPDATA%\Programs\Python\Python3*\python.exe`
+
+
+## 何时可以撤掉代理
+
+每次桌面版/hub 升级后跑一次直连探测（需 AGNES_API_KEY 已在环境变量）：
+
+    python <repo>\agnes_proxy\probe_direct.py
+
+- 检查 hub `/v1/responses` 是否接受 `type:"namespace"` 工具、是否保留图片 parts
+- 检查当前 app 内置引擎是否仍在发送 namespace 工具（本地抓包，不影响线上）
+- 输出结论：exit 0 = 可撤代理（改 base_url 直连 + `install.ps1 -Unregister`）；exit 1 = 保留
 
 ## 日志
 
