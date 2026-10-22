@@ -22,6 +22,8 @@ use tracing::warn;
 
 const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
+const INITIAL_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_secs(30);
+const MAX_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResponsesStreamRequest {
@@ -33,6 +35,8 @@ pub(crate) struct ResponsesStreamRetryState {
     retries: u64,
     connection_retries: u64,
     connection_retry_delay: Duration,
+    rate_limit_retries: u64,
+    rate_limit_retry_delay: Duration,
 }
 
 impl Default for ResponsesStreamRetryState {
@@ -41,6 +45,8 @@ impl Default for ResponsesStreamRetryState {
             retries: 0,
             connection_retries: 0,
             connection_retry_delay: INITIAL_CONNECTION_RETRY_DELAY,
+            rate_limit_retries: 0,
+            rate_limit_retry_delay: INITIAL_RATE_LIMIT_RETRY_DELAY,
         }
     }
 }
@@ -114,6 +120,56 @@ pub(crate) async fn handle_response_stream_error(
         retry_state.connection_retry_delay = retry_delay
             .saturating_mul(2)
             .min(MAX_CONNECTION_RETRY_DELAY);
+        return Ok(());
+    }
+
+    // Third-party gateways rate-limit hard (429s, overloads, mid-stream timeouts).
+    // When enabled, wait out the quota window with doubling backoff (capped) and
+    // keep re-issuing the sampling request instead of letting the turn die.
+    let rate_limited = matches!(
+        err.details(),
+        CodexErrorDetails::RateLimitExceeded(_)
+            | CodexErrorDetails::RetryLimit(_)
+            | CodexErrorDetails::ServerOverloaded
+            | CodexErrorDetails::RequestTimeout
+            | CodexErrorDetails::Timeout
+    );
+    if turn_context
+        .config
+        .features
+        .enabled(Feature::UnboundedRateLimitRetries)
+        && matches!(request, ResponsesStreamRequest::Sampling)
+        && rate_limited
+        && !turn_context.session_source.is_internal()
+    {
+        let retry_delay = retry_state.rate_limit_retry_delay;
+        // Respect a server-advised deadline when present; otherwise use the local
+        // doubling backoff (capped) so the wait grows with each 429.
+        let wait = retry_after
+            .map(RetryAfter::remaining_delay)
+            .unwrap_or(retry_delay)
+            .min(MAX_RATE_LIMIT_RETRY_DELAY);
+        warn!(
+            turn_id = %turn_context.sub_id,
+            error = %err,
+            ?wait,
+            "rate limited or timed out; waiting to retry"
+        );
+        sess.notify_stream_error(
+            turn_context,
+            "Rate limited... waiting to retry",
+            err,
+        )
+        .await;
+        retry_state.rate_limit_retries = retry_state.rate_limit_retries.saturating_add(1);
+        codex_client::record_retry!(
+            retry_state.rate_limit_retries,
+            wait,
+            operation
+        );
+        tokio::time::sleep(wait).await;
+        retry_state.rate_limit_retry_delay =
+            retry_delay.saturating_mul(2).min(MAX_RATE_LIMIT_RETRY_DELAY);
         return Ok(());
     }
 

@@ -454,7 +454,9 @@ other non-default provider fields are not supported"
         let retry = ApiRetryConfig {
             max_attempts: self.request_max_retries(),
             base_delay: Duration::from_millis(200),
-            retry_429: false,
+            // Retry 429s at the transport layer too: third-party gateways rate-limit
+            // aggressively and the sampling layer re-issues the whole request.
+            retry_429: true,
             retry_5xx: true,
             retry_transport: true,
         };

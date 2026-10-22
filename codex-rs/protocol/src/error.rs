@@ -436,7 +436,10 @@ impl CodexErr {
             | CodexErrorDetails::BioPolicy { .. }
             | CodexErrorDetails::MisalignmentPolicyViolation { .. } => None,
             CodexErrorDetails::ServerOverloaded | CodexErrorDetails::RetryLimit(_) => {
-                self.server_retry_delay()
+                // Prefer server advice when present, but fall back to local backoff so a
+                // 429/overload without a Retry-After header is still retryable instead of
+                // terminal (third-party gateways often omit the header).
+                Some(self.server_retry_delay().unwrap_or_else(|| backoff(retry_count)))
             }
             CodexErrorDetails::Stream(..)
             | CodexErrorDetails::ContentFilter
