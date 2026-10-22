@@ -17,6 +17,7 @@ import http.client
 import io
 import json
 import logging
+import os
 import sys
 import time
 import urllib.parse
@@ -25,7 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 HOST = "127.0.0.1"
-PORT = 8787
+PORT = int(os.environ.get("AGNES_PROXY_PORT", "8787"))
 UPSTREAM = "https://apihub.agnes-ai.com"
 BASE = Path(__file__).resolve().parent
 LOG_PATH = BASE / "proxy.log"
@@ -34,6 +35,48 @@ LOG_MAX = 5 * 1024 * 1024
 ERR_CAP = 4096
 TRANSIENT_400 = b"Generation failed, try later"  # upstream transient marker
 RETRY_SLEEP = 2.0
+# Rate-limit / overload absorption: when upstream 429s (e.g. agnes daily text
+# quota "1 request every 3 min"), wait and re-issue instead of surfacing the
+# 429 to the client. This keeps codex (CLI + desktop) alive through the window.
+RATE_LIMIT_STATUSES = (408, 429, 503, 504)
+RATE_LIMIT_MAX_ATTEMPTS = 12
+RATE_LIMIT_BASE_WAIT = float(os.environ.get("AGNES_PROXY_RATE_WAIT_BASE", "30.0"))  # first 429 wait (seconds)
+RATE_LIMIT_MAX_WAIT = 300.0   # per-wait cap (seconds)
+# Test hook: first N requests to upstream get a forced 429 (then real).
+FORCED_429 = int(os.environ.get("AGNES_PROXY_FORCE_429", "0"))
+
+
+def _retry_after_seconds(resp) -> int:
+    """Wait seconds from a Retry-After header (delta-seconds form), else 0."""
+    raw = resp.getheader("Retry-After")
+    if raw is None:
+        return 0
+    try:
+        return max(0, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _transient_info(resp, errb: bytes, attempt: int, max_attempts: int):
+    """Return (is_transient, wait_s, why) for a failed upstream response.
+
+    429/408/503/504 are absorbed with a long (Retry-After or doubling) wait;
+    generic transient 400/5xx use the short backoff. Non-transient 4xx fail fast.
+    """
+    status = resp.status
+    rate_limited = status in RATE_LIMIT_STATUSES
+    generic = TRANSIENT_400 in errb or 500 <= status <= 599
+    transient = rate_limited or generic
+    if not transient or attempt >= max_attempts - 1:
+        return False, 0.0, ""
+    if rate_limited:
+        delay = min(RATE_LIMIT_MAX_WAIT,
+                    max(_retry_after_seconds(resp),
+                        RATE_LIMIT_BASE_WAIT * (2 ** attempt)))
+        return True, delay, "rate-limited HTTP %d" % status
+    delay = min(60.0, RETRY_SLEEP * (2 ** attempt))
+    return True, delay, ("transient 400" if TRANSIENT_400 in errb else "5xx %d" % status)
+
 
 
 class _ReplayedError:
@@ -54,6 +97,9 @@ class _ReplayedError:
 
     def getheaders(self):
         return []
+
+    def getheader(self, name):
+        return None
 
     def close(self):
         pass
@@ -776,74 +822,116 @@ class Handler(BaseHTTPRequestHandler):
             upstream = None
             # Hardened retry: upstream "Generation failed" 400s and 5xx
             # (incl. the hub's own 500 bad_response_body during backend
-            # wobbles) are transient. Back off exponentially up to ~80s
-            # before surfacing the error to the client.
-            max_attempts = 6
+            # wobbles) are transient; 408/429/503/504 are absorbed with a
+            # long doubling wait so clients survive quota windows.
+            max_attempts = RATE_LIMIT_MAX_ATTEMPTS
+            generic_left = 6
             for attempt in range(max_attempts):
-                bconn = http.client.HTTPSConnection(host, timeout=600)
-                bconn.request("POST", url, body=upstream_body, headers=headers)
-                resp = bconn.getresponse()
-                transient = False
-                errb = b""
-                if resp.status >= 400:
-                    errb = resp.read()
-                    resp.close()
-                    bconn.close()
-                    if TRANSIENT_400 in errb or 500 <= resp.status <= 599:
-                        transient = attempt < max_attempts - 1
+                if FORCED_429 > 0 and attempt < FORCED_429:
+                    log.info("IMAGE BRIDGE FORCED 429 (attempt %d/%d)",
+                             attempt + 1, max_attempts)
+                    resp = _ReplayedError(429, b'{"error":{"message":"forced 429 (test hook)"}}')
+                    errb = b""
+                    bconn = None
                 else:
+                    bconn = http.client.HTTPSConnection(host, timeout=600)
+                    bconn.request("POST", url, body=upstream_body, headers=headers)
+                    resp = bconn.getresponse()
+                if resp.status < 400:
                     upstream = resp
                     break
-                if transient:
+                errb = resp.read()
+                if resp.status in RATE_LIMIT_STATUSES:
+                    delay = min(RATE_LIMIT_MAX_WAIT,
+                                max(_retry_after_seconds(resp),
+                                    RATE_LIMIT_BASE_WAIT * (2 ** min(attempt, 4))))
+                    log.info("IMAGE BRIDGE rate-limited HTTP %d (attempt %d/%d), "
+                             "retry in %.0fs",
+                             resp.status, attempt + 1, max_attempts, delay)
+                    resp.close()
+                    if bconn is not None:
+                        bconn.close()
+                    time.sleep(delay)
+                    continue
+                generic = TRANSIENT_400 in errb or 500 <= resp.status <= 599
+                resp.close()
+                if bconn is not None:
+                    bconn.close()
+                if generic and generic_left > 0:
+                    generic_left -= 1
                     delay = min(60.0, RETRY_SLEEP * (2 ** attempt))
-                    why = "transient 400" if TRANSIENT_400 in errb else "5xx %d" % resp.status
+                    why = ("transient 400" if TRANSIENT_400 in errb
+                           else "5xx %d" % resp.status)
                     log.info("IMAGE BRIDGE %s (attempt %d/%d), retry in %.0fs",
                              why, attempt + 1, max_attempts, delay)
                     time.sleep(delay)
                     continue
                 upstream = _ReplayedError(resp.status, errb)
                 break
+            if upstream is None:
+                upstream = _ReplayedError(
+                    502, b'{"error":{"message":"upstream unavailable after retries"}}')
             total = self._send_image_bridge_response(upstream, bridge_model, bridge == "stream")
             upstream.close()
-            bconn.close()
+            if bconn is not None:
+                bconn.close()
         else:
             if upstream_body:
                 headers["content-length"] = str(len(upstream_body))
             # Passthrough retry: the hub's /v1/responses flaps 5xx during
             # backend wobbles and occasionally returns the opaque
-            # "Generation failed" 400. Back off (up to ~80s) before
-            # surfacing the error; non-transient 4xx fail fast.
-            max_attempts = 6
+            # "Generation failed" 400; 408/429/503/504 are absorbed with a
+            # long doubling wait so clients survive quota windows.
+            max_attempts = RATE_LIMIT_MAX_ATTEMPTS
+            generic_left = 6
             upstream = None
             for attempt in range(max_attempts):
-                conn = http.client.HTTPSConnection(host, timeout=600)
-                conn.request(method, url,
-                             body=upstream_body if upstream_body else None,
-                             headers=headers)
-                resp = conn.getresponse()
-                transient = False
-                if resp.status >= 400:
-                    errb = resp.read()
-                    resp.close()
-                    conn.close()
-                    if (TRANSIENT_400 in errb or 500 <= resp.status <= 599) \
-                            and attempt < max_attempts - 1:
-                        transient = True
-                    if transient:
-                        delay = min(60.0, RETRY_SLEEP * (2 ** attempt))
-                        why = ("transient 400" if TRANSIENT_400 in errb
-                               else "5xx %d" % resp.status)
-                        log.info("PASSTHROUGH %s (attempt %d/%d), retry in %.0fs",
-                                 why, attempt + 1, max_attempts, delay)
-                        time.sleep(delay)
-                        continue
-                    upstream = _ReplayedError(resp.status, errb)
-                    break
+                if FORCED_429 > 0 and attempt < FORCED_429:
+                    log.info("PASSTHROUGH FORCED 429 (attempt %d/%d)",
+                             attempt + 1, max_attempts)
+                    resp = _ReplayedError(429, b'{"error":{"message":"forced 429 (test hook)"}}')
+                    errb = b""
+                    conn = None
                 else:
+                    conn = http.client.HTTPSConnection(host, timeout=600)
+                    conn.request(method, url,
+                                 body=upstream_body if upstream_body else None,
+                                 headers=headers)
+                    resp = conn.getresponse()
+                if resp.status < 400:
                     upstream = resp
                     break
+                errb = resp.read()
+                if resp.status in RATE_LIMIT_STATUSES:
+                    delay = min(RATE_LIMIT_MAX_WAIT,
+                                max(_retry_after_seconds(resp),
+                                    RATE_LIMIT_BASE_WAIT * (2 ** min(attempt, 4))))
+                    log.info("PASSTHROUGH rate-limited HTTP %d (attempt %d/%d), "
+                             "retry in %.0fs",
+                             resp.status, attempt + 1, max_attempts, delay)
+                    resp.close()
+                    if conn is not None:
+                        conn.close()
+                    time.sleep(delay)
+                    continue
+                generic = TRANSIENT_400 in errb or 500 <= resp.status <= 599
+                resp.close()
+                if conn is not None:
+                    conn.close()
+                if generic and generic_left > 0:
+                    generic_left -= 1
+                    delay = min(60.0, RETRY_SLEEP * (2 ** attempt))
+                    why = ("transient 400" if TRANSIENT_400 in errb
+                           else "5xx %d" % resp.status)
+                    log.info("PASSTHROUGH %s (attempt %d/%d), retry in %.0fs",
+                             why, attempt + 1, max_attempts, delay)
+                    time.sleep(delay)
+                    continue
+                upstream = _ReplayedError(resp.status, errb)
+                break
             if upstream is None:
-                upstream = _ReplayedError(502, b'{"error":{"message":"upstream unavailable after retries"}}')
+                upstream = _ReplayedError(
+                    502, b'{"error":{"message":"upstream unavailable after retries"}}')
 
             self.send_response(upstream.status)
             for key, val in upstream.getheaders():
@@ -868,7 +956,8 @@ class Handler(BaseHTTPRequestHandler):
                 if capture_all and len(captured) < ERR_CAP:
                     captured += chunk[: ERR_CAP - len(captured)]
             upstream.close()
-            conn.close()
+            if conn is not None:
+                conn.close()
 
             if captured:
                 log.info("RESP_HTTP_%d body=%s", upstream.status,
