@@ -4583,7 +4583,7 @@ dependencies = [
 
 [[package]]
 name = "codex-runtime-agent-instance"
-version = "0.0.0"
+version = "0.164.0"
 dependencies = [
  "base64 0.22.1",
  "codex-agent-identity",
@@ -5110,7 +5110,7 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-critical-path"
-version = "0.0.0"
+version = "0.164.0"
 dependencies = [
  "pretty_assertions",
 ]
