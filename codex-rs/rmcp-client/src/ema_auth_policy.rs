@@ -4,6 +4,9 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
+use codex_config::McpEmaTokenEndpointAuthMethod;
+use rmcp::transport::auth::enterprise::EmaError;
+use rmcp::transport::auth::enterprise::EmaExchangeStage;
 use serde_json::Value;
 use url::Host;
 use url::Url;
@@ -34,8 +37,74 @@ pub enum EmaCredentialKind {
     Keyring,
 }
 
-/// Carries only a credential kind and an already sanitized auth failure to transport.
-/// Unexpected errors deliberately retain neither provider text nor their source chain.
+/// A diagnostic containing only static local text or sanitized SDK exchange fields.
+/// Never retains an arbitrary error's display text, provider response, or source chain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmaErrorDetail {
+    message: &'static str,
+    stage: Option<EmaExchangeStage>,
+    status: Option<u16>,
+}
+
+impl EmaErrorDetail {
+    pub fn new(message: &'static str) -> Self {
+        Self {
+            message,
+            stage: None,
+            status: None,
+        }
+    }
+
+    pub fn from_error(error: &anyhow::Error) -> Self {
+        // SDK diagnostics are already sanitized, including allowlisted OAuth codes.
+        // Prefer them to an outer operation label when both are available.
+        if let Some(error) = error.downcast_ref::<EmaError>() {
+            let (stage, status, message) = match error {
+                EmaError::InvalidRequest(message) => (None, None, *message),
+                EmaError::InvalidResponse { stage, message } => (Some(*stage), None, *message),
+                EmaError::RequestFailed(stage) => (Some(*stage), None, "request failed"),
+                EmaError::InvalidGrant(stage) => (Some(*stage), None, "invalid_grant"),
+                EmaError::InsufficientUserAuthentication(stage) => {
+                    (Some(*stage), None, "insufficient_user_authentication")
+                }
+                EmaError::OAuthRejected {
+                    stage,
+                    status,
+                    code,
+                } => (Some(*stage), Some(*status), *code),
+                _ => (None, None, "enterprise MCP token exchange failed"),
+            };
+            return Self {
+                message,
+                stage,
+                status,
+            };
+        }
+        error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<Self>())
+            .last()
+            .copied()
+            .or_else(|| error.downcast_ref::<Self>().copied())
+            .unwrap_or_else(|| Self::new("enterprise MCP token exchange failed"))
+    }
+}
+
+impl std::fmt::Display for EmaErrorDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(stage) = self.stage {
+            write!(f, "{stage:?}: ")?;
+        }
+        if let Some(status) = self.status {
+            write!(f, "HTTP {status}: ")?;
+        }
+        f.write_str(self.message)
+    }
+}
+
+impl std::error::Error for EmaErrorDetail {}
+
+/// Carries a credential kind and sanitized failure to transport, without raw error chains.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmaTokenSourceError {
     AuthFailure {
@@ -44,6 +113,7 @@ pub enum EmaTokenSourceError {
     },
     Unexpected {
         credential: EmaCredentialKind,
+        detail: EmaErrorDetail,
     },
 }
 
@@ -56,12 +126,17 @@ impl EmaTokenSourceError {
     }
 
     pub fn unexpected(credential: EmaCredentialKind) -> Self {
-        Self::Unexpected { credential }
+        Self::Unexpected {
+            credential,
+            detail: EmaErrorDetail::new("enterprise MCP token exchange failed"),
+        }
     }
 
     fn credential(self) -> EmaCredentialKind {
         match self {
-            Self::AuthFailure { credential, .. } | Self::Unexpected { credential } => credential,
+            Self::AuthFailure { credential, .. } | Self::Unexpected { credential, .. } => {
+                credential
+            }
         }
     }
 
@@ -106,6 +181,9 @@ impl EmaTokenSourceError {
 
 impl std::fmt::Display for EmaTokenSourceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Self::Unexpected { detail, .. } = self {
+            return std::fmt::Display::fmt(detail, f);
+        }
         let message = match (self.credential(), self.failure()) {
             (
                 _,
@@ -163,10 +241,48 @@ pub(crate) fn ema_reauthentication_required(message: &'static str) -> anyhow::Er
     anyhow::Error::new(EmaAuthFailure::ReauthenticationRequired).context(message)
 }
 
-pub(crate) fn validate_ema_public_client_auth(
+pub(crate) fn resolve_ema_client_auth(
     advertised_methods: Option<&Value>,
+    client_secret: Option<&str>,
+    token_endpoint_auth_method: Option<McpEmaTokenEndpointAuthMethod>,
     issuer_description: &str,
-) -> Result<()> {
+) -> Result<rmcp::transport::auth::enterprise::EmaClientAuthentication> {
+    use oauth2::ClientSecret;
+    use rmcp::transport::auth::enterprise::EmaClientAuthentication;
+
+    if let Some(secret) = client_secret {
+        if secret.trim().is_empty() {
+            bail!("{issuer_description} client secret must not be empty");
+        }
+        let registered_method = token_endpoint_auth_method.unwrap_or_default();
+        // RFC 8414 defaults absent server capabilities to Basic. Capabilities
+        // validate the registration; they do not select its authentication method.
+        let supported = match advertised_methods {
+            None => registered_method == McpEmaTokenEndpointAuthMethod::ClientSecretBasic,
+            Some(methods) => methods.as_array().is_some_and(|methods| {
+                methods
+                    .iter()
+                    .any(|method| method.as_str() == Some(registered_method.as_str()))
+            }),
+        };
+        if !supported {
+            bail!(
+                "{issuer_description} does not support the registered token endpoint authentication method"
+            );
+        }
+        let secret = ClientSecret::new(secret.to_owned());
+        return Ok(match registered_method {
+            McpEmaTokenEndpointAuthMethod::ClientSecretBasic => {
+                EmaClientAuthentication::ClientSecretBasic(secret)
+            }
+            McpEmaTokenEndpointAuthMethod::ClientSecretPost => {
+                EmaClientAuthentication::ClientSecretPost(secret)
+            }
+        });
+    }
+    if token_endpoint_auth_method.is_some() {
+        bail!("{issuer_description} token endpoint authentication method requires a client secret");
+    }
     let advertised_methods = advertised_methods.ok_or_else(|| {
         anyhow!(
             "{issuer_description} does not explicitly advertise public-client token endpoint authentication"
@@ -178,7 +294,7 @@ pub(crate) fn validate_ema_public_client_auth(
     if !methods.iter().any(|method| method.as_str() == Some("none")) {
         bail!("{issuer_description} does not support public-client token endpoint authentication");
     }
-    Ok(())
+    Ok(EmaClientAuthentication::None)
 }
 
 pub(crate) fn validate_ema_oauth_endpoint(endpoint: &str, description: &str) -> Result<()> {

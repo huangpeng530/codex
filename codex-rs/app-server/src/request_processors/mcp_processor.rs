@@ -230,6 +230,8 @@ impl McpRequestProcessor {
                         credential_name: &credential_name,
                         issuer: &idp.issuer,
                         client_id: &idp.client_id,
+                        client_secret: idp.client_secret.as_ref().map(|secret| secret.as_str()),
+                        token_endpoint_auth_method: idp.token_endpoint_auth_method,
                         keyring_backend_kind: mcp_config.auth_keyring_backend_kind,
                         callback_port: mcp_config.mcp_oauth_callback_port,
                         callback_url: mcp_config.mcp_oauth_callback_url.as_deref(),
@@ -251,7 +253,13 @@ impl McpRequestProcessor {
                 login.login_id,
                 Box::pin(async move {
                     match completion.wait_for(|state| state.is_complete()).await {
-                        Ok(result) if *result == EnterpriseLoginCompletion::Succeeded => Ok(()),
+                        Ok(result) => match *result {
+                            EnterpriseLoginCompletion::Succeeded => Ok(()),
+                            EnterpriseLoginCompletion::Failed(detail) => Err(detail.into()),
+                            EnterpriseLoginCompletion::Pending => {
+                                Err(anyhow::anyhow!("Enterprise sign-in failed."))
+                            }
+                        },
                         _ => Err(anyhow::anyhow!("Enterprise sign-in failed.")),
                     }
                 }),

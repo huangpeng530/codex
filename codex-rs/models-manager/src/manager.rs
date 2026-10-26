@@ -1,4 +1,5 @@
 use super::cache::FileModelsCache;
+use crate::ModelCatalogOriginator;
 use crate::cache::ModelsCache;
 use crate::cache::ModelsCacheEntry;
 use crate::collaboration_mode_presets::builtin_collaboration_mode_presets;
@@ -10,12 +11,14 @@ use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::config_types::CollaborationModeMask;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CoreResult;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
@@ -41,6 +44,14 @@ const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 /// manager owns refresh policy, cache behavior, and catalog merging; it calls
 /// this endpoint only when it decides a remote refresh should happen.
 pub trait ModelsEndpointClient: fmt::Debug + Send + Sync {
+    /// Return an endpoint whose requests and identity use this catalog originator.
+    fn for_originator(
+        &self,
+        _originator: ModelCatalogOriginator,
+    ) -> Option<Arc<dyn ModelsEndpointClient>> {
+        None
+    }
+
     /// Opaque identity of the current provider and credentials, without resolving auth.
     ///
     /// Must distinguish provider routing and authenticated principals within the
@@ -116,6 +127,11 @@ type SharedModelsEndpointClient = Arc<dyn ModelsEndpointClient>;
 
 /// Coordinates model discovery plus cached metadata on disk.
 pub trait ModelsManager: fmt::Debug + Send + Sync {
+    /// Select an isolated catalog for a supported thread originator. `None` retains this manager.
+    fn for_originator(&self, _originator: &str) -> Option<SharedModelsManager> {
+        None
+    }
+
     /// Supply startup API-key discovery policy; live changes require a new session.
     /// Static catalogs ignore this setting.
     fn set_api_key_model_discovery_enabled(&self, _enabled: bool) {}
@@ -287,11 +303,12 @@ impl CatalogSource {
 /// OpenAI-compatible model manager backed by bundled models, cache, and `/models`.
 #[derive(Debug)]
 pub struct OpenAiModelsManager {
+    originator_managers: std::sync::Mutex<HashMap<ModelCatalogOriginator, SharedModelsManager>>,
     remote_models: RwLock<ModelsCacheEntry>,
     cache: Option<Arc<dyn ModelsCache>>,
     endpoint_client: SharedModelsEndpointClient,
     catalog_source: CatalogSource,
-    api_key_model_discovery_enabled: AtomicBool,
+    api_key_model_discovery_enabled: Arc<AtomicBool>,
     auth_manager: Option<Arc<AuthManager>>,
 }
 
@@ -346,6 +363,7 @@ impl OpenAiModelsManager {
         auth_manager: Option<Arc<AuthManager>>,
     ) -> Self {
         Self {
+            originator_managers: std::sync::Mutex::new(HashMap::new()),
             remote_models: RwLock::new(ModelsCacheEntry {
                 fetched_at: Utc::now(),
                 etag: None,
@@ -354,7 +372,7 @@ impl OpenAiModelsManager {
                 models: load_remote_models_from_file().unwrap_or_default(),
             }),
             cache,
-            api_key_model_discovery_enabled: AtomicBool::new(false),
+            api_key_model_discovery_enabled: Arc::new(AtomicBool::new(false)),
             endpoint_client,
             catalog_source: CatalogSource::Default,
             auth_manager,
@@ -381,6 +399,31 @@ impl StaticModelsManager {
 }
 
 impl ModelsManager for OpenAiModelsManager {
+    fn for_originator(&self, originator: &str) -> Option<SharedModelsManager> {
+        let originator = ModelCatalogOriginator::from_originator(originator)?;
+        let mut managers = self
+            .originator_managers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(manager) = managers.get(&originator) {
+            return Some(Arc::clone(manager));
+        }
+        let endpoint = self.endpoint_client.for_originator(originator)?;
+        // A backend that cannot partition must not overwrite the default catalog.
+        let cache = self
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.for_originator(originator));
+        let mut manager = Self::new_with_optional_cache(cache, endpoint, self.auth_manager.clone());
+        if matches!(self.catalog_source, CatalogSource::ExplicitProvider(_)) {
+            manager = manager.with_provider_catalog();
+        }
+        manager.api_key_model_discovery_enabled = Arc::clone(&self.api_key_model_discovery_enabled);
+        let manager: SharedModelsManager = Arc::new(manager);
+        managers.insert(originator, Arc::clone(&manager));
+        Some(manager)
+    }
+
     fn set_api_key_model_discovery_enabled(&self, enabled: bool) {
         self.api_key_model_discovery_enabled
             .store(enabled, Ordering::SeqCst);
@@ -594,7 +637,19 @@ impl OpenAiModelsManager {
         {
             Ok(response) => response,
             Err(error) => {
-                if matches!(&self.catalog_source, CatalogSource::ExplicitProvider(_)) {
+                // A failed fetch is not an authoritative empty catalog. Keep the last
+                // successful snapshot (and its original freshness) unless access was
+                // explicitly rejected. Provider/auth identity checks still govern reuse.
+                let is_provider_catalog =
+                    matches!(&self.catalog_source, CatalogSource::ExplicitProvider(_));
+                let access_denied = matches!(error.http_status_code_value(), Some(401 | 403));
+                let credentials_rejected = matches!(
+                    error.details(),
+                    CodexErrorDetails::RefreshTokenFailed(_)
+                        | CodexErrorDetails::GatewayLoginRequired(_)
+                );
+
+                if is_provider_catalog && (access_denied || credentials_rejected) {
                     {
                         let mut current = self.remote_models.write().await;
                         if request_identity != self.endpoint_client.identity() {
@@ -724,7 +779,7 @@ impl OpenAiModelsManager {
         };
         {
             let current = self.remote_models.read().await;
-            // A failed fetch must not be replaced by stale cache data even if invalidation failed.
+            // An access rejection must not be replaced by stale cache data if invalidation failed.
             if current.fetched_at == DateTime::<Utc>::MIN_UTC
                 && current.identity.as_ref() == Some(&identity)
             {

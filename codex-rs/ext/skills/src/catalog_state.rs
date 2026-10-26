@@ -1,11 +1,13 @@
 //! Reusable provider catalog caches and Cloud resource contents.
 //! Provider catalogs remain unfiltered until step preparation applies policy.
+//! Cloud discovery publishes only into its current auth and resource generation.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
 use codex_exec_server::ResolvedSelectedCapabilityRoot;
+use codex_extension_api::CatalogRefreshBackoff;
 use codex_mcp::McpResourceClient;
 use codex_mcp::McpResourceClientAuthKey;
 use codex_mcp::McpResourceServerCacheKey;
@@ -32,6 +34,7 @@ pub(crate) struct SkillCatalogState {
     pub(crate) executor_v2_cache: Option<CachedExecutorV2Catalog>,
     // Shared by both discovery modes.
     pub(crate) cloud_generation: Option<Arc<CloudSkillGeneration>>,
+    pub(crate) cloud_retry: Option<CatalogRefreshBackoff>,
     pub(crate) cloud_resources: CloudResourceCache,
 }
 
@@ -105,7 +108,7 @@ pub(crate) struct CachedExecutorV2Catalog {
 }
 
 impl CachedExecutorV2Catalog {
-    pub(crate) fn matches(
+    pub(crate) fn same_discovery(
         &self,
         snapshots: &[codex_exec_server::ExecutorCapabilityDiscoveryV2Snapshot],
     ) -> bool {
@@ -114,9 +117,7 @@ impl CachedExecutorV2Catalog {
                 .snapshots
                 .iter()
                 .zip(snapshots)
-                .all(|(previous, current)| {
-                    current.result.is_ok() && previous.same_discovery(current)
-                })
+                .all(|(previous, current)| previous.same_discovery(current))
     }
 }
 
@@ -177,7 +178,8 @@ impl CachedExecutorDiscoveryCatalog {
                         previous.selected_root == current.selected_root
                             && match (&previous.result, &current.result) {
                                 (Ok(previous), Ok(current)) => Arc::ptr_eq(previous, current),
-                                _ => false,
+                                (Err(previous), Err(current)) => previous == current,
+                                (Ok(_), Err(_)) | (Err(_), Ok(_)) => false,
                             }
                     },
                 )

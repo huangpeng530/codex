@@ -2485,7 +2485,7 @@ impl AuthManager {
 
         let auth = self.auth_cached()?;
         if let Some(reason) = Self::proactive_refresh_reason(&auth)
-            && let Err(err) = self.refresh_token_with_reason(reason).await
+            && let Err(err) = self.refresh_token_with_reason(reason, Some(&auth)).await
         {
             tracing::error!("Failed to refresh token: {}", err);
             return Some(auth);
@@ -2573,6 +2573,17 @@ impl AuthManager {
             .acquire_owned()
             .await
             .map_err(|_| std::io::Error::other("Account refresh coordination is unavailable."))?;
+        Ok(self
+            .account_oauth_grant()
+            .await?
+            .map(|grant| AccountOAuthGrantLease { grant, permit }))
+    }
+
+    /// Reads an owner-checked grant without waiting for or excluding account refresh.
+    /// Use this for inspection; lease the grant again before exchanging its refresh token.
+    pub async fn account_oauth_grant(
+        self: &Arc<Self>,
+    ) -> std::io::Result<Option<AccountOAuthGrant>> {
         let login_generation = self.auth_change_state_tx.borrow().login_generation;
         let Some(tokens) = self.read_account_grant_tokens().await? else {
             return Ok(None);
@@ -2585,7 +2596,7 @@ impl AuthManager {
         if !grant.owner_is_current() {
             return Ok(None);
         }
-        Ok(Some(AccountOAuthGrantLease { grant, permit }))
+        Ok(Some(grant))
     }
 
     /// Checks the persisted account owner without requiring an EMA-eligible account grant.
@@ -3094,17 +3105,28 @@ impl AuthManager {
         Ok(auth)
     }
 
-    /// Attempt to refresh the token by first performing a guarded reload from
-    /// the active auth source. If the loaded token differs from the cached token,
-    /// we can assume that the source already refreshed it. Otherwise, ask the
-    /// token authority to refresh.
+    /// Refreshes external auth through its provider. For managed auth, first
+    /// performs a guarded reload: if the stored token differs from the cached
+    /// token, reuse it; otherwise, ask the token authority to refresh.
     pub async fn refresh_token(&self) -> Result<(), RefreshTokenError> {
-        self.refresh_token_with_reason(RefreshReason::Forced).await
+        self.refresh_token_with_reason(RefreshReason::Forced, /*expected_auth*/ None)
+            .await
+    }
+
+    /// Refreshes only if the expected credential is still current after acquiring
+    /// the existing refresh guard, so queued callers reuse a completed refresh.
+    pub async fn refresh_token_if_unchanged(
+        &self,
+        expected_auth: &CodexAuth,
+    ) -> Result<(), RefreshTokenError> {
+        self.refresh_token_with_reason(RefreshReason::Forced, Some(expected_auth))
+            .await
     }
 
     async fn refresh_token_with_reason(
         &self,
         reason: RefreshReason,
+        expected_auth: Option<&CodexAuth>,
     ) -> Result<(), RefreshTokenError> {
         let _refresh_guard = self.refresh_lock.acquire().await.map_err(|_| {
             RefreshTokenError::Permanent(RefreshTokenFailedError::new(
@@ -3113,6 +3135,14 @@ impl AuthManager {
             ))
         })?;
         let auth_before_reload = self.auth_cached();
+        if let Some(expected_auth) = expected_auth
+            && !Self::auths_equal_for_refresh(auth_before_reload.as_ref(), Some(expected_auth))
+        {
+            return Ok(());
+        }
+        if self.has_external_auth() {
+            return self.refresh_token_from_authority_impl(reason).await;
+        }
         if auth_before_reload
             .as_ref()
             .is_some_and(|auth| auth.is_api_key_auth() || auth.is_personal_access_token_auth())

@@ -25,6 +25,7 @@ use codex_login::default_client::ClientRedirectPolicy;
 use codex_login::default_client::create_client_for_route_async;
 use codex_model_provider_info::CHATGPT_CODEX_BASE_URL;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_models_manager::ModelCatalogOriginator;
 use codex_models_manager::manager::ModelsEndpointClient;
 use codex_models_manager::manager::ModelsEndpointFuture;
 use codex_models_manager::manager::ModelsEndpointResponse;
@@ -43,8 +44,6 @@ use crate::combined_auth::compose_auth;
 
 const MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 const MODELS_ENDPOINT: &str = "/models";
-// Bound downloads from explicitly configured catalogs before decoding or caching them.
-const MAX_MODEL_CATALOG_BYTES: usize = 1024 * 1024;
 
 /// Provider-owned OpenAI-compatible `/models` endpoint.
 #[derive(Debug)]
@@ -156,13 +155,12 @@ impl OpenAiModelsEndpoint {
                 .await?;
             let client = ModelsClient::new(transport, api_provider, api_auth)
                 .with_telemetry(Some(request_telemetry));
-            let response_body_limit_bytes = self
-                .provider_info
-                .model_catalog_url
-                .as_ref()
-                .map(|_| MAX_MODEL_CATALOG_BYTES);
             client
-                .list_models(request_url, HeaderMap::new(), response_body_limit_bytes)
+                .list_models(
+                    request_url,
+                    HeaderMap::new(),
+                    /*response_body_limit_bytes*/ None,
+                )
                 .await
                 .map_err(|mut error| {
                     if self.provider_info.model_catalog_url.is_some()
@@ -211,6 +209,25 @@ impl OpenAiModelsEndpoint {
 }
 
 impl ModelsEndpointClient for OpenAiModelsEndpoint {
+    fn for_originator(
+        &self,
+        originator: ModelCatalogOriginator,
+    ) -> Option<Arc<dyn ModelsEndpointClient>> {
+        let mut provider_info = self.provider_info.clone();
+        let headers = provider_info.http_headers.get_or_insert_default();
+        headers.retain(|name, _| !name.eq_ignore_ascii_case("originator"));
+        headers.insert("originator".to_string(), originator.as_str().into());
+        if let Some(headers) = &mut provider_info.env_http_headers {
+            headers.retain(|name, _| !name.eq_ignore_ascii_case("originator"));
+        }
+        Some(Arc::new(Self {
+            provider_info,
+            auth_manager: self.auth_manager.clone(),
+            gateway_auth_manager: self.gateway_auth_manager.clone(),
+            transport_builder: Arc::clone(&self.transport_builder),
+        }))
+    }
+
     fn supports_api_key_models(&self) -> bool {
         self.provider_info.model_catalog_url.is_some()
             || (self.provider_info.is_openai() && self.provider_info.base_url.is_none())
@@ -397,6 +414,10 @@ impl RequestTelemetry for ModelsRequestTelemetry {
 mod timeout_tests;
 
 #[cfg(test)]
+#[path = "models_originator_tests.rs"]
+mod originator_tests;
+
+#[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
     use std::sync::Mutex;
@@ -413,7 +434,6 @@ mod tests {
     use codex_models_manager::model_info::model_info_from_slug;
     use codex_protocol::auth::AuthMode;
     use codex_protocol::config_types::ModelProviderAuthInfo;
-    use codex_protocol::error::CodexErrorDetails;
     use codex_protocol::openai_models::ModelVisibility;
     use codex_protocol::openai_models::ModelsResponse;
     use pretty_assertions::assert_eq;
@@ -906,41 +926,6 @@ mod tests {
                 "model catalog must contain unique, non-empty model slugs"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn explicit_catalog_rejects_oversized_response() {
-        let server = MockServer::start().await;
-        let mut body = br#"{"models":[]}"#.to_vec();
-        body.resize(MAX_MODEL_CATALOG_BYTES + 1, b' ');
-        Mock::given(method("GET"))
-            .and(path("/codex/models"))
-            .respond_with(ResponseTemplate::new(/*s*/ 200).set_body_bytes(body))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let endpoint = OpenAiModelsEndpoint::new(
-            ModelProviderInfo {
-                model_catalog_url: Some(format!("{}/codex/models", server.uri()).into()),
-                ..ModelProviderInfo::default()
-            },
-            /*auth_manager*/ None,
-            /*gateway_auth_manager*/ None,
-        );
-        let error = endpoint
-            .list_models(
-                "1.2.3",
-                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
-            )
-            .await
-            .expect_err("oversized catalog should be rejected");
-        let CodexErrorDetails::InvalidRequest(message) = error.details() else {
-            panic!("expected a response-size error, got {error:?}");
-        };
-        assert_eq!(
-            message,
-            &format!("response body exceeds the {MAX_MODEL_CATALOG_BYTES} byte limit")
-        );
     }
 
     #[tokio::test]

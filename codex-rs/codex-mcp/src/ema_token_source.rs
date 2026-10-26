@@ -16,6 +16,7 @@ use codex_rmcp_client::EmaAuthTokenExchangeRequest;
 use codex_rmcp_client::EmaCredentialKind;
 use codex_rmcp_client::EmaCredentialLease;
 use codex_rmcp_client::EmaCredentialSnapshot;
+use codex_rmcp_client::EmaErrorDetail;
 use codex_rmcp_client::EmaIdpIdentityRequest;
 use codex_rmcp_client::EmaInvalidGrantSource;
 use codex_rmcp_client::EmaTokenSource;
@@ -61,7 +62,11 @@ impl EnterpriseTokenSource {
         http_client: Arc<dyn HttpClient>,
     ) -> Result<Self> {
         auth.check_account().await?;
-        let account = auth.manager.lease_account_oauth_grant().await?;
+        let account = auth
+            .manager
+            .lease_account_oauth_grant()
+            .await
+            .map_err(|_| EmaErrorDetail::new("enterprise MCP account credential read failed"))?;
         let client_id = account
             .as_ref()
             .filter(|lease| {
@@ -112,7 +117,12 @@ impl EnterpriseTokenSource {
             && error
                 .downcast_ref::<EmaTokenSourceError>()
                 .is_some_and(EmaTokenSourceError::is_authentication_required)
-            && let Some(lease) = self.auth.manager.lease_account_oauth_grant().await?
+            && let Some(lease) = self
+                .auth
+                .manager
+                .lease_account_oauth_grant()
+                .await
+                .map_err(|_| EmaErrorDetail::new("enterprise MCP account credential read failed"))?
         {
             let rejected = self
                 .auth
@@ -143,7 +153,8 @@ impl EnterpriseTokenSource {
             .auth
             .manager
             .lease_account_oauth_grant()
-            .await?
+            .await
+            .map_err(|_| EmaErrorDetail::new("enterprise MCP account credential read failed"))?
             .ok_or(EmaAuthFailure::ReauthenticationRequired)?;
         if !account_grant_is_usable(lease.tokens(), self.registration.idp())
             || lease
@@ -181,7 +192,7 @@ impl EnterpriseTokenSource {
                     let tokens = grant.tokens();
                     // Metadata discovery must not block ordinary account refresh.
                     let identity = resolve_ema_account_idp_identity(
-                        &idp.issuer,
+                        idp,
                         client_id,
                         &tokens.id_token.raw_jwt,
                         tokens.refresh_token.clone(),
@@ -194,7 +205,10 @@ impl EnterpriseTokenSource {
                         .auth
                         .manager
                         .lease_account_oauth_grant()
-                        .await?
+                        .await
+                        .map_err(|_| {
+                            EmaErrorDetail::new("enterprise MCP account credential read failed")
+                        })?
                         .ok_or(EmaAuthFailure::ReauthenticationRequired)?;
                     if AccountOAuthGrantRevision::from(lease.tokens())
                         != AccountOAuthGrantRevision::from(tokens)
@@ -218,6 +232,8 @@ impl EnterpriseTokenSource {
                     resolve_ema_idp_identity(EmaIdpIdentityRequest {
                         issuer: &idp.issuer,
                         client_id,
+                        client_secret: idp.client_secret.as_ref().map(|secret| secret.as_str()),
+                        token_endpoint_auth_method: idp.token_endpoint_auth_method,
                         credentials: snapshot.acquire_current_ema_credentials().await?,
                         http_client: Arc::clone(&self.http_client),
                         redirect_mode: StreamableHttpRedirectMode::Legacy,
@@ -233,6 +249,8 @@ impl EnterpriseTokenSource {
                 resource: self.registration.resource(),
                 scopes: self.registration.scopes(),
                 mcp_client_id: self.registration.client_id(),
+                mcp_client_secret: self.registration.client_secret(),
+                token_endpoint_auth_method: self.registration.token_endpoint_auth_method(),
                 expected_authorization_server_issuer: self
                     .registration
                     .authorization_server_issuer(),
@@ -250,14 +268,22 @@ impl EnterpriseTokenSource {
         .await?;
         match receipt {
             ExchangeReceipt::Account(grant) => {
-                if grant.current_tokens().await?.as_ref().is_none_or(|tokens| {
-                    !account_grant_is_usable(tokens, idp)
-                        || self
-                            .auth
-                            .config
-                            .ema_state
-                            .requires_sign_in(&self.registration, tokens)
-                }) {
+                if grant
+                    .current_tokens()
+                    .await
+                    .map_err(|_| {
+                        EmaErrorDetail::new("enterprise MCP account credential validation failed")
+                    })?
+                    .as_ref()
+                    .is_none_or(|tokens| {
+                        !account_grant_is_usable(tokens, idp)
+                            || self
+                                .auth
+                                .config
+                                .ema_state
+                                .requires_sign_in(&self.registration, tokens)
+                    })
+                {
                     // Discard this bearer. The bounded retry below reacquires the grant
                     // only if its credential changed under the same admitted owner.
                     bail!(EmaAuthFailure::ReauthenticationRequired);
@@ -301,8 +327,16 @@ impl EnterpriseTokenSource {
                             bail!(EmaTokenSourceError::unexpected(EmaCredentialKind::Account));
                         }
                         if idp_rejected(&error)
-                            && let Some(lease) =
-                                self.auth.manager.lease_account_oauth_grant().await?
+                            && let Some(lease) = self
+                                .auth
+                                .manager
+                                .lease_account_oauth_grant()
+                                .await
+                                .map_err(|_| {
+                                    EmaErrorDetail::new(
+                                        "enterprise MCP account credential read failed",
+                                    )
+                                })?
                         {
                             if AccountOAuthGrantRevision::from(lease.tokens())
                                 != AccountOAuthGrantRevision::from(grant.tokens())
@@ -370,7 +404,10 @@ impl EmaTokenSource for EnterpriseTokenSource {
                     None if codex_rmcp_client::is_authentication_required_error(&error) => {
                         EmaTokenSourceError::new(kind, EmaAuthFailure::ReauthenticationRequired)
                     }
-                    None => EmaTokenSourceError::unexpected(kind),
+                    None => EmaTokenSourceError::Unexpected {
+                        credential: kind,
+                        detail: EmaErrorDetail::from_error(&error),
+                    },
                 }
                 .into()
             }

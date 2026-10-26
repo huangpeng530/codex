@@ -140,7 +140,11 @@ impl SampleTask {
             ThreadHistoryMode::Legacy => build_legacy_api_turns_from_rollout_items(&history.items)
                 .last()
                 .is_some_and(|turn| {
-                    turn.id == params.expected_turn_id && turn.status == TurnStatus::Completed
+                    turn.id == params.expected_turn_id
+                        && matches!(
+                            turn.status,
+                            TurnStatus::Completed | TurnStatus::Failed | TurnStatus::Interrupted
+                        )
                 }),
             ThreadHistoryMode::Paginated => store
                 .list_turns(ListTurnsParams {
@@ -157,12 +161,17 @@ impl SampleTask {
                 .first()
                 .is_some_and(|turn| {
                     turn.turn_id == params.expected_turn_id
-                        && turn.status == StoredTurnStatus::Completed
+                        && matches!(
+                            turn.status,
+                            StoredTurnStatus::Completed
+                                | StoredTurnStatus::Failed
+                                | StoredTurnStatus::Interrupted
+                        )
                 }),
         };
         if !matches_source {
             return Err(invalid_request(
-                "sample source turn is no longer the latest completed turn",
+                "sample source turn must be the latest finished turn",
             ));
         }
         let (mut options, settings) = Box::pin(async {
@@ -204,7 +213,12 @@ impl SampleTask {
             model.supports_reasoning_effort_updates && options.config.model_provider.is_openai()
         });
         options.session_source = Some(SessionSource::Custom("thread_sample".to_string()));
-        options.thread_source = Some(ThreadSource::Feature("thread_sample".to_string()));
+        options.thread_source = Some(
+            params
+                .thread_source
+                .map(Into::into)
+                .unwrap_or_else(|| ThreadSource::Feature("thread_sample".to_string())),
+        );
         options.parent_trace = trace.clone();
         if cancellation.is_cancelled() {
             return Err(internal_error("sample canceled"));
@@ -250,6 +264,7 @@ impl SampleTask {
                 turn_trigger: params.turn_trigger,
                 ..Default::default()
             })
+            .with_responses_metadata(params.responsesapi_client_metadata)
             .with_trace(trace);
             if !matches!(
                 fork.thread

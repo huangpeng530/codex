@@ -320,6 +320,7 @@ pub(crate) struct AppServerBootstrap {
     pub(crate) has_chatgpt_account: bool,
     pub(crate) available_models: Vec<ModelPreset>,
     pub(crate) collaboration_modes: Vec<codex_protocol::config_types::CollaborationModeMask>,
+    pub(crate) allowed_approval_policies: Option<Vec<AskForApproval>>,
 }
 
 pub(crate) struct AppServerSession {
@@ -759,6 +760,10 @@ impl AppServerSession {
                 )
                 .await;
         }
+        let allowed_approval_policies = requirements
+            .requirements
+            .as_ref()
+            .and_then(|requirements| requirements.allowed_approval_policies.clone());
         self.managed_new_thread_defaults = requirements
             .requirements
             .and_then(|requirements| requirements.models)
@@ -821,7 +826,7 @@ impl AppServerSession {
                     true,
                 )
             }
-            Some(Account::AmazonBedrock { .. }) => {
+            Some(Account::AmazonBedrock { .. } | Account::Gcp {}) => {
                 (None, None, None, None, FeedbackAudience::External, false)
             }
             None => (None, None, None, None, FeedbackAudience::External, false),
@@ -838,6 +843,7 @@ impl AppServerSession {
             has_chatgpt_account,
             available_models,
             collaboration_modes,
+            allowed_approval_policies,
         })
     }
 
@@ -1851,11 +1857,13 @@ pub(crate) async fn start_thread_with_request_handle(
     launch_choices: StartupLaunchChoices,
 ) -> Result<AppServerStartedThread> {
     let request_id = RequestId::String(format!("startup-thread-start-{}", Uuid::new_v4()));
-    let mut params = thread_start_params_from_config(
+    let mut params = thread_start_params_with_reviewer(
         &config,
         thread_params_mode,
         remote_cwd_override.as_deref(),
         /*session_start_source*/ None,
+        launch_choices.approvals_reviewer,
+        &launch_choices.approval_policy,
     );
     thread_tool_transport.validate_config(&config)?;
     launch_choices.configure(&mut params);
@@ -2177,6 +2185,24 @@ pub(crate) fn thread_start_params_from_config(
     remote_cwd_override: Option<&std::path::Path>,
     session_start_source: Option<ThreadStartSource>,
 ) -> ThreadStartParams {
+    thread_start_params_with_reviewer(
+        config,
+        thread_params_mode,
+        remote_cwd_override,
+        session_start_source,
+        startup_launch::StartupApprovalsReviewer::Config,
+        &startup_launch::StartupApprovalPolicy::ResolvedConfig,
+    )
+}
+
+fn thread_start_params_with_reviewer(
+    config: &Config,
+    thread_params_mode: ThreadParamsMode,
+    remote_cwd_override: Option<&std::path::Path>,
+    session_start_source: Option<ThreadStartSource>,
+    reviewer_source: startup_launch::StartupApprovalsReviewer,
+    policy_source: &startup_launch::StartupApprovalPolicy,
+) -> ThreadStartParams {
     let permissions = permissions_selection_from_config(config, thread_params_mode);
     let sandbox = permissions
         .is_none()
@@ -2193,8 +2219,19 @@ pub(crate) fn thread_start_params_from_config(
         service_tier: service_tier_override_from_config(config),
         cwd: thread_cwd_from_config(config, thread_params_mode, remote_cwd_override),
         runtime_workspace_roots: thread_params_mode.workspace_roots_from_config(config),
-        approval_policy: Some(config.permissions.approval_policy.value().into()),
-        approvals_reviewer: approvals_reviewer_override_from_config(config),
+        approval_policy: match policy_source {
+            startup_launch::StartupApprovalPolicy::ResolvedConfig => {
+                Some(config.permissions.approval_policy.value().into())
+            }
+            startup_launch::StartupApprovalPolicy::Invocation(policy) => *policy,
+            startup_launch::StartupApprovalPolicy::ConfigOverride(_) => None,
+        },
+        approvals_reviewer: match reviewer_source {
+            startup_launch::StartupApprovalsReviewer::Config => {
+                approvals_reviewer_override_from_config(config)
+            }
+            startup_launch::StartupApprovalsReviewer::Invocation(reviewer) => reviewer,
+        },
         sandbox,
         permissions,
         config: config_request_overrides_from_config(config, thread_params_mode),

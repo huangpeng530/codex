@@ -69,6 +69,23 @@
           ],
           "title": "AmazonBedrockAccount",
           "type": "object"
+        },
+        {
+          "description": "Google Cloud Vertex AI with externally managed credentials.",
+          "properties": {
+            "type": {
+              "enum": [
+                "gcp"
+              ],
+              "title": "GcpAccountType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "GcpAccount",
+          "type": "object"
         }
       ]
     },
@@ -1010,6 +1027,42 @@
           "anyOf": [
             {
               "$ref": "#/definitions/ApplicationNetworkRequirements"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "storage": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ApplicationStorageRequirements"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ApplicationStorageRequirements": {
+      "description": "Managed storage settings for new Desktop workspaces, not filesystem access restrictions.",
+      "properties": {
+        "defaultProjectParent": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LegacyAppPathString"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "projectlessWorkspaceRoot": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LegacyAppPathString"
             },
             {
               "type": "null"
@@ -4342,6 +4395,7 @@
             "rateLimitExceeded",
             "flexUnavailable",
             "serverOverloaded",
+            "modelNotFound",
             "cyberPolicy",
             "misalignmentPolicyViolation",
             "tooManyDenials",
@@ -9485,6 +9539,13 @@
         "enabled": {
           "type": "boolean"
         },
+        "environmentId": {
+          "description": "The owning execution environment, if this hook came from its requirements.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "eventName": {
           "$ref": "#/definitions/HookEventName"
         },
@@ -9652,7 +9713,7 @@
           "default": "unknown"
         },
         "sourcePath": {
-          "$ref": "#/definitions/AbsolutePathBuf"
+          "$ref": "#/definitions/LegacyAppPathString"
         },
         "startedAt": {
           "format": "int64",
@@ -9773,11 +9834,18 @@
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "cwds": {
-          "description": "When empty, defaults to the current session working directory.",
+          "description": "Working directories to inspect when no thread is specified. An empty list uses the session cwd.",
           "items": {
             "type": "string"
           },
           "type": "array"
+        },
+        "threadId": {
+          "description": "List a loaded thread's hooks, including its selected environments. Omit `cwds` in this mode.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "title": "HooksListParams",
@@ -12235,6 +12303,16 @@
           "description": "When true, only managed allowlist entries are respected while managed network enforcement is active.",
           "type": [
             "boolean",
+            "null"
+          ]
+        },
+        "reviewDomains": {
+          "description": "Host patterns routed to network approval before ordinary allow rules.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
             "null"
           ]
         },

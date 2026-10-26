@@ -824,6 +824,7 @@ async fn run_cloud_plugin_projection_scenarios() -> anyhow::Result<()> {
                 .environment_ready(
                     &selection,
                     EnvironmentConfig {
+                        environment_hooks: Default::default(),
                         allow_login_shell: false,
                         workspace_roots: selection.workspace_roots.clone(),
                         permission_profile: PermissionProfileSnapshot::legacy(
@@ -908,6 +909,7 @@ async fn run_cloud_plugin_projection_scenarios() -> anyhow::Result<()> {
             initialized, installed,
             "{case}: cloud-only declarations must not start MCPs"
         );
+        // Failed discovery stays in cooldown across both model steps.
         assert_eq!(
             cloud.calls.load(Ordering::SeqCst),
             usize::from(cloud_enabled),
