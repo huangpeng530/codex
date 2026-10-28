@@ -44,6 +44,17 @@ RATE_LIMIT_BASE_WAIT = float(os.environ.get("AGNES_PROXY_RATE_WAIT_BASE", "30.0"
 RATE_LIMIT_MAX_WAIT = 300.0   # per-wait cap (seconds)
 # Test hook: first N requests to upstream get a forced 429 (then real).
 FORCED_429 = int(os.environ.get("AGNES_PROXY_FORCE_429", "0"))
+# Empty-completion guard: the hub occasionally answers /v1/responses with a
+# well-formed 200 SSE that contains ZERO output items (no text / reasoning /
+# tool_call). Codex then silently ends the turn ("stopped working"). Detect
+# it BEFORE anything is forwarded to the client and re-issue the request.
+EMPTY_PEEK_CAP = 16384        # buffer this much; a real stream passes it fast
+# Empty flaps come in multi-minute windows (observed 5+ empties in ~50s), so
+# ride them out like 429 windows: many attempts, growing wait, 60s cap.
+EMPTY_RETRY_MAX = int(os.environ.get("AGNES_PROXY_EMPTY_RETRY", "12"))
+EMPTY_WAIT_BASE = 5.0
+# Test hook: force the first attempt of each request to look empty.
+FORCED_EMPTY = int(os.environ.get("AGNES_PROXY_FORCE_EMPTY", "0"))
 
 
 def _retry_after_seconds(resp) -> int:
@@ -884,6 +895,8 @@ class Handler(BaseHTTPRequestHandler):
             # long doubling wait so clients survive quota windows.
             max_attempts = RATE_LIMIT_MAX_ATTEMPTS
             generic_left = 6
+            empty_left = EMPTY_RETRY_MAX
+            peek_buf = b""
             upstream = None
             for attempt in range(max_attempts):
                 if FORCED_429 > 0 and attempt < FORCED_429:
@@ -899,6 +912,39 @@ class Handler(BaseHTTPRequestHandler):
                                  headers=headers)
                     resp = conn.getresponse()
                 if resp.status < 400:
+                    # Empty-completion guard (see constants): peek the head of
+                    # the stream; if it ends before EMPTY_PEEK_CAP with no
+                    # output_item.added, it is the hub's silent-empty reply.
+                    is_empty = False
+                    pbuf = b""
+                    ct = (resp.getheader("content-type") or "").lower()
+                    if method == "POST" and path.endswith("/responses") \
+                            and "event-stream" in ct:
+                        if FORCED_EMPTY > attempt:
+                            log.info("PASSTHROUGH FORCED EMPTY (attempt %d/%d)",
+                                     attempt + 1, max_attempts)
+                            is_empty = True
+                        else:
+                            while len(pbuf) < EMPTY_PEEK_CAP:
+                                pchk = resp.read(65536)
+                                if not pchk:
+                                    break
+                                pbuf += pchk
+                            is_empty = (len(pbuf) < EMPTY_PEEK_CAP
+                                        and b"output_item.added" not in pbuf)
+                        if is_empty and empty_left > 0:
+                            empty_left -= 1
+                            delay = min(60.0, EMPTY_WAIT_BASE * (2 ** attempt))
+                            log.info("PASSTHROUGH empty completion "
+                                     "(attempt %d/%d, left %d), retry in %.0fs",
+                                     attempt + 1, max_attempts, empty_left,
+                                     delay)
+                            resp.close()
+                            if conn is not None:
+                                conn.close()
+                            time.sleep(delay)
+                            continue
+                        peek_buf = pbuf
                     upstream = resp
                     break
                 errb = resp.read()
@@ -944,6 +990,10 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
             total = 0
+            if peek_buf:
+                self.wfile.write(peek_buf)
+                self.wfile.flush()
+                total += len(peek_buf)
             captured = b""
             capture_all = upstream.status >= 400
             while True:
