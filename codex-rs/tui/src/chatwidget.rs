@@ -106,7 +106,7 @@ use codex_app_server_protocol::SkillMetadata;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadGoal as AppThreadGoal;
 use codex_app_server_protocol::ThreadGoalStatus as AppThreadGoalStatus;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadSettings;
 use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
 use codex_app_server_protocol::ThreadTokenUsage;
@@ -379,6 +379,7 @@ mod review;
 mod review_popups;
 use self::review::ReviewState;
 mod safety_buffering;
+mod safety_recourse;
 mod service_tiers;
 mod settings;
 mod settings_popups;
@@ -620,6 +621,7 @@ pub(crate) struct ChatWidget {
     last_unified_wait: Option<UnifiedExecWaitState>,
     unified_exec_wait_streak: Option<UnifiedExecWaitStreak>,
     turn_lifecycle: TurnLifecycleState,
+    safety_recourse: Option<safety_recourse::PendingRecourse>,
     realtime_conversation: RealtimeConversationUiState,
     realtime_conversation_available_for_thread: bool,
     safety_buffering: SafetyBufferingState,
@@ -1413,12 +1415,15 @@ impl ChatWidget {
             || !display.local_images.is_empty()
             || !display.remote_image_urls.is_empty()
         {
-            self.add_to_history(history_cell::new_user_prompt(
-                display.message,
-                display.text_elements,
-                display.local_images,
-                display.remote_image_urls,
-            ));
+            self.add_to_history(
+                history_cell::new_user_prompt(
+                    display.message,
+                    display.text_elements,
+                    display.local_images,
+                    display.remote_image_urls,
+                )
+                .with_async_replies(display.replies, self.config.cwd.as_path()),
+            );
         }
     }
 
@@ -2068,7 +2073,16 @@ impl ChatWidget {
 
     #[cfg(test)]
     pub(crate) fn status_line_text(&self) -> Option<String> {
-        self.bottom_pane.status_line_text()
+        self.status_line_content()
+            .cloned()
+            .map(|content| content.into_hyperlink_line().line.to_string())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn status_line_content(
+        &self,
+    ) -> Option<&crate::bottom_pane::footer_content::FooterContent> {
+        self.bottom_pane.status_line_content()
     }
 
     pub(crate) fn clear_token_usage(&mut self) {

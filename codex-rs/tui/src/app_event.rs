@@ -298,6 +298,7 @@ pub(crate) enum AppEvent {
     AccountEmailLoaded {
         request_id: uuid::Uuid,
         email: Option<String>,
+        workspace: Option<String>,
     },
     SecuritySetupLoaded {
         request_id: uuid::Uuid,
@@ -463,6 +464,13 @@ pub(crate) enum AppEvent {
         model: String,
         turn: AppCommand,
         prompt: UserMessage,
+    },
+
+    /// Fork before a blocked turn and send the selected safer follow-up.
+    ContinueSafetyRecourse {
+        thread_id: ThreadId,
+        turn_id: String,
+        prompt: String,
     },
 
     /// Deliver a synthetic history lookup response to a specific thread channel.
@@ -1230,6 +1238,12 @@ pub(crate) enum AppEvent {
 
     /// Update the current model slug in the running app and widget.
     UpdateModel(String),
+
+    /// Apply a model-picker selection to the active conversation and saved local defaults.
+    ApplyModelSelection {
+        model: String,
+        effort: Option<ReasoningEffort>,
+    },
 
     /// Apply an explicit Astra selection and offer the flourish only if it changed the model on
     /// its original task. Automatic model updates do not use this event.

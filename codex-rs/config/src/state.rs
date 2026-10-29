@@ -553,6 +553,44 @@ impl ConfigLayerStack {
         })
     }
 
+    pub fn with_session_plugins(mut self, plugins: TomlValue) -> std::io::Result<Self> {
+        let session_index = self.layers.iter().rposition(|layer| {
+            layer.name == ConfigLayerSource::SessionFlags && !layer.is_disabled()
+        });
+        if let Some(session_index) = session_index {
+            for (index, layer) in self.layers.iter_mut().enumerate() {
+                if layer.name != ConfigLayerSource::SessionFlags || layer.is_disabled() {
+                    continue;
+                }
+                let mut config = layer.config.clone();
+                let table = config.as_table_mut().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "session config must be a table",
+                    )
+                })?;
+                if index == session_index {
+                    table.insert("plugins".to_owned(), plugins.clone());
+                } else if table.remove("plugins").is_none() {
+                    continue;
+                }
+                *layer = ConfigLayerEntry::new(ConfigLayerSource::SessionFlags, config);
+            }
+        } else {
+            let index = self.layers.partition_point(|layer| {
+                layer.name.precedence() <= ConfigLayerSource::SessionFlags.precedence()
+            });
+            self.layers.insert(
+                index,
+                ConfigLayerEntry::new(
+                    ConfigLayerSource::SessionFlags,
+                    TomlValue::Table([("plugins".to_owned(), plugins)].into_iter().collect()),
+                ),
+            );
+        }
+        Ok(self)
+    }
+
     /// Returns a new stack with the user layer copied from `other`, preserving
     /// every non-user layer already present in this stack.
     pub fn with_user_layer_from(&self, other: &Self) -> Self {
@@ -647,7 +685,11 @@ impl ConfigLayerStack {
             );
         }
 
-        if let Some(layer) = self.layers_low_to_high().next_back() {
+        let is_credential_origin =
+            |path: &str| provider_paths.iter().any(|prefix| path.starts_with(prefix));
+        if origins.keys().any(|path| is_credential_origin(path))
+            && let Some(layer) = self.layers_low_to_high().next_back()
+        {
             let effective = self.effective_config();
             let mut effective_origins = HashMap::new();
             record_origins(
@@ -658,8 +700,7 @@ impl ConfigLayerStack {
                 &include,
             );
             origins.retain(|path, _| {
-                !provider_paths.iter().any(|prefix| path.starts_with(prefix))
-                    || effective_origins.contains_key(path)
+                !is_credential_origin(path) || effective_origins.contains_key(path)
             });
         }
 

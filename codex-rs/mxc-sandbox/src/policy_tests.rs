@@ -322,79 +322,18 @@ fn volume_expansion_does_not_turn_read_only_child_writable() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn volume_expansion_does_not_turn_read_only_alias_writable() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let root = canonical_root(&temp)?;
-    let readonly = root.join("protected");
-    let alias = root.join("alias");
-    std::fs::write(&readonly, "protected")?;
-    std::fs::hard_link(&readonly, &alias)?;
-    let fs = FileSystemSandboxPolicy::restricted(vec![
-        entry(&root, FileSystemAccessMode::Write)?,
-        entry(&readonly, FileSystemAccessMode::Read)?,
-    ]);
-    let profile =
-        PermissionProfile::from_runtime_permissions(&fs, NetworkSandboxPolicy::Restricted);
-    let request = build_request(
-        &command(&profile, &root),
-        &root,
-        Vec::new(),
-        std::slice::from_ref(&root),
-        &[],
-    )?;
-    let alias = alias.display().to_string();
-    assert_eq!(
-        (
-            request.policy.readwrite_paths.contains(&alias),
-            request.policy.readonly_paths.contains(&alias),
-        ),
-        (false, true)
-    );
-    Ok(())
-}
-
 #[cfg(unix)]
 #[test]
-fn volume_expansion_uses_normalized_root_access() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let root = canonical_root(&temp)?;
-    let volume = root.join("volume");
-    let child = volume.join("child");
-    let alias = root.join("alias");
-    std::fs::create_dir_all(&child)?;
-    std::os::unix::fs::symlink(&volume, &alias)?;
-    let fs = FileSystemSandboxPolicy::restricted(vec![
-        entry(&volume, FileSystemAccessMode::Write)?,
-        entry(&alias, FileSystemAccessMode::Read)?,
-    ]);
-    let profile =
-        PermissionProfile::from_runtime_permissions(&fs, NetworkSandboxPolicy::Restricted);
-    let request = build_request(
-        &command(&profile, &root),
-        &root,
-        Vec::new(),
-        std::slice::from_ref(&volume),
-        &[],
-    )?;
-    let child = child.display().to_string();
-    assert_eq!(
-        (
-            request.policy.readwrite_paths.contains(&child),
-            request.policy.readonly_paths.contains(&child),
-        ),
-        (false, true)
-    );
-    Ok(())
-}
-
-#[cfg(unix)]
-#[test]
-fn volume_expansion_skips_uninspectable_children() -> Result<()> {
+fn volume_expansion_skips_broken_links_and_preserves_other_grants() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = canonical_root(&temp)?;
     let uninspectable = root.join("loop");
     std::os::unix::fs::symlink(&uninspectable, &uninspectable)?;
+    std::os::unix::fs::symlink(root.join("missing"), root.join("dangling"))?;
+    let readable = root.join("readable");
+    std::fs::write(&readable, "readable")?;
+    let alias = root.join("alias");
+    std::os::unix::fs::symlink(&readable, &alias)?;
     let denied = root.join("secret");
     std::fs::write(&denied, "secret")?;
     let fs = FileSystemSandboxPolicy::restricted(vec![
@@ -413,7 +352,11 @@ fn volume_expansion_skips_uninspectable_children() -> Result<()> {
     assert_eq!(
         (request.policy.readwrite_paths, request.policy.denied_paths),
         (
-            vec![root.to_str().unwrap().to_owned()],
+            vec![
+                root.to_str().unwrap().to_owned(),
+                alias.to_str().unwrap().to_owned(),
+                readable.to_str().unwrap().to_owned()
+            ],
             vec![denied.to_str().unwrap().to_owned()],
         )
     );
@@ -421,7 +364,7 @@ fn volume_expansion_skips_uninspectable_children() -> Result<()> {
 }
 
 #[test]
-fn full_access_enumerates_children_of_every_volume() -> Result<()> {
+fn only_write_access_expands_volume_children() -> Result<()> {
     let first = tempfile::tempdir()?;
     let second = tempfile::tempdir()?;
     let unmapped = tempfile::tempdir()?;
@@ -429,19 +372,16 @@ fn full_access_enumerates_children_of_every_volume() -> Result<()> {
     let volumes = [canonical_root(&first)?, canonical_root(&second)?];
     std::fs::create_dir(volumes[0].join("one"))?;
     std::fs::create_dir(volumes[1].join("two"))?;
-    let mut expected = [
-        volumes[0].clone(),
-        volumes[0].join("one"),
-        volumes[1].clone(),
-        volumes[1].join("two"),
-        explicit.clone(),
-    ];
-    expected.sort();
     let mut fs = FileSystemSandboxPolicy::read_only();
     // Like an unmapped UNC share, this grant is outside the supplied volumes.
     fs.entries
         .push(entry(&explicit, FileSystemAccessMode::Read)?);
     for access in [FileSystemAccessMode::Read, FileSystemAccessMode::Write] {
+        let mut expected = vec![volumes[0].clone(), volumes[1].clone(), explicit.clone()];
+        if access == FileSystemAccessMode::Write {
+            expected.extend([volumes[0].join("one"), volumes[1].join("two")]);
+        }
+        expected.sort();
         fs.entries[0].access = access;
         fs.entries[1].access = access;
         let profile =
@@ -855,13 +795,11 @@ fn narrowing_one_volume_keeps_the_other_volume_root_grant() -> Result<()> {
             .into_iter()
             .filter(|path| Path::new(path).starts_with(&volumes[1]))
             .collect();
-        assert_eq!(
-            second_grants,
-            vec![
-                volumes[1].to_str().unwrap().to_owned(),
-                volumes[1].join("child").to_str().unwrap().to_owned(),
-            ]
-        );
+        let mut expected = vec![volumes[1].to_str().unwrap().to_owned()];
+        if root_access == FileSystemAccessMode::Write {
+            expected.push(volumes[1].join("child").to_str().unwrap().to_owned());
+        }
+        assert_eq!(second_grants, expected);
     }
     Ok(())
 }
