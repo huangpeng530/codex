@@ -5526,6 +5526,8 @@ dependencies = [
  "pretty_assertions",
  "schemars 0.8.22",
  "serde_json",
+ "tempfile",
+ "tokio",
  "url",
 ]
 
@@ -5894,6 +5896,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "base64 0.22.1",
+ "codex-agent-graph-store",
  "codex-analytics",
  "codex-arg0",
  "codex-attachment-store",

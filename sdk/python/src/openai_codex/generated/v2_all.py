@@ -2126,6 +2126,13 @@ class InitializeCapabilities(BaseModel):
             description="Opt into `attestation/generate` requests for upstream `x-oai-attestation`.",
         ),
     ] = False
+    required_human_approval: Annotated[
+        bool | None,
+        Field(
+            alias="requiredHumanApproval",
+            description="Present `humanCommand` approvals to a person and return only a one-time decision. Requires `experimentalApi`. Pending requests can be replayed to compatible clients.",
+        ),
+    ] = None
 
 
 class InitializeParams(BaseModel):
@@ -9257,6 +9264,7 @@ class OtelRequirements(BaseModel):
     exporter: OtelExporter | None = None
     log_agent_responses: bool | None = None
     log_guardian_assessments: bool | None = None
+    log_sse_deltas: bool | None = None
     log_user_prompt: bool | None = None
     metrics_exporter: OtelExporter | None = None
     span_attributes: dict[str, Any] | None = None
